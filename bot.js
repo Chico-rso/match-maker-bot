@@ -19,12 +19,18 @@ const FORMATS = {
 
 // 📝 Функция для создания кликабельного упоминания пользователя
 function formatPlayerMention(member) {
-    const fullName = `${ member.first_name }${ member.last_name ? ` ${ member.last_name }` : '' }`;
+    // Если есть first_name (новый формат), используем его
+    if (member.first_name) {
+        const fullName = `${ member.first_name }${ member.last_name ? ` ${ member.last_name }` : '' }`;
 
-    if (member.username) {
-        return `[@${ member.username }](tg://user?id=${ member.id })`;
+        if (member.username) {
+            return `[@${ member.username }](tg://user?id=${ member.id })`;
+        } else {
+            return `[${ fullName }](tg://user?id=${ member.id })`;
+        }
     } else {
-        return `[${ fullName }](tg://user?id=${ member.id })`;
+        // Старый формат - только username
+        return member.username ? `@${ member.username }` : `Пользователь ${ member.id }`;
     }
 }
 
@@ -161,35 +167,28 @@ db.prepare(
      )`,
 ).run();
 
-// Миграция: добавляем автора голосования, если столбца нет
-try {
-    db.prepare(`ALTER TABLE sessions
-        ADD COLUMN author_id TEXT`).run();
-} catch (e) {
-    // столбец уже существует — игнорируем
-}
+// Миграция: добавляем недостающие столбцы
+const migrateTable = (tableName, columnName, columnType) => {
+    try {
+        const columns = db.prepare(`PRAGMA table_info(${tableName})`).all();
+        const columnExists = columns.some(col => col.name === columnName);
 
-// Миграция: добавляем username, first_name и last_name в members, если столбцов нет
-try {
-    db.prepare(`ALTER TABLE members
-        ADD COLUMN username TEXT`).run();
-    db.prepare(`ALTER TABLE members
-        ADD COLUMN first_name TEXT`).run();
-    db.prepare(`ALTER TABLE members
-        ADD COLUMN last_name TEXT`).run();
-} catch (e) {
-    // столбцы уже существуют — игнорируем
-}
+        if (!columnExists) {
+            db.prepare(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${columnType}`).run();
+            console.log(`✅ Добавлен столбец ${columnName} в таблицу ${tableName}`);
+        }
+    } catch (e) {
+        console.error(`❌ Ошибка миграции столбца ${columnName}:`, e.message);
+    }
+};
 
-// Миграция: добавляем date и time в sessions, если столбцов нет
-try {
-    db.prepare(`ALTER TABLE sessions
-        ADD COLUMN date TEXT`).run();
-    db.prepare(`ALTER TABLE sessions
-        ADD COLUMN time TEXT`).run();
-} catch (e) {
-    // столбцы уже существуют — игнорируем
-}
+// Выполняем миграции
+migrateTable('sessions', 'author_id', 'TEXT');
+migrateTable('members', 'username', 'TEXT');
+migrateTable('members', 'first_name', 'TEXT');
+migrateTable('members', 'last_name', 'TEXT');
+migrateTable('sessions', 'date', 'TEXT');
+migrateTable('sessions', 'time', 'TEXT');
 
 db.prepare(
     `CREATE TABLE IF NOT EXISTS votes
@@ -209,15 +208,34 @@ db.prepare(
         )`,
 ).run();
 
+db.prepare(
+    `CREATE TABLE IF NOT EXISTS draft_sessions
+    (
+        chat_id
+        INTEGER
+        PRIMARY
+        KEY,
+        format
+        TEXT,
+        date
+        TEXT,
+        time
+        TEXT,
+        created_at
+        DATETIME
+        DEFAULT
+        CURRENT_TIMESTAMP
+    )`,
+).run();
+
 const bot = new Telegraf(TOKEN);
 
 // Регистрируем меню команд с готовыми опциями
 bot.telegram.setMyCommands([
-    {command: 'start_vote', description: 'Запустить голосование: /start_vote 6x6|7x7|8x8|9x9 [дата YYYY-MM-DD] [время HH:MM]'},
-    {command: 'start_6x6', description: 'Запустить голосование 6x6 [дата] [время]'},
-    {command: 'start_7x7', description: 'Запустить голосование 7x7 [дата] [время]'},
-    {command: 'start_8x8', description: 'Запустить голосование 8x8 [дата] [время]'},
-    {command: 'start_9x9', description: 'Запустить голосование 9x9 [дата] [время]'},
+    {command: 'start_vote', description: 'Выбрать формат игры: /start_vote 6x6|7x7|8x8|9x9'},
+    {command: 'set_time', description: 'Установить время: /set_time YYYY-MM-DD HH:MM'},
+    {command: 'confirm_vote', description: 'Запустить голосование'},
+    {command: 'cancel_setup', description: 'Отменить настройку голосования'},
     {command: 'set_datetime', description: 'Изменить дату/время: /set_datetime YYYY-MM-DD HH:MM'},
     {command: 'end_vote', description: 'Завершить текущее голосование'},
 ]);
@@ -305,39 +323,86 @@ bot.on('left_chat_member', (ctx) => {
                 WHERE id = ?`).run(member.id.toString());
 });
 
-// 🏁 Команда старта голосования
+// 🏁 Команда выбора формата игры
 bot.command('start_vote', async (ctx) => {
     const args = ctx.message.text.split(' ');
     const fmt = args[1];
-    const date = args[2];
-    const time = args[3];
-    await startVoteWithFormat(ctx, fmt, date, time);
+
+    if (!fmt || !FORMATS[fmt]) {
+        return ctx.reply('⚠️ Укажи формат: /start_vote 6x6 | 7x7 | 8x8 | 9x9\n\nПосле этого:\n/set_time YYYY-MM-DD HH:MM\n/confirm_vote');
+    }
+
+    try {
+        const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
+        const isAdmin = member.status === 'administrator' || member.status === 'creator';
+        if (!isAdmin) {
+            return ctx.reply('🚫 Запускать голосование могут только администраторы.');
+        }
+    } catch (err) {
+        return ctx.reply('🚫 Не удалось проверить права. Попробуйте позже.');
+    }
+
+    // Сохраняем формат в черновик
+    db.prepare(
+        `INSERT OR REPLACE INTO draft_sessions (chat_id, format)
+         VALUES (?, ?)`,
+    ).run(ctx.chat.id, fmt);
+
+    await ctx.reply(
+        `⚽ Формат выбран: ${fmt} (нужно ${FORMATS[fmt]} игроков)\n\n` +
+        `📅 Установи время командой:\n` +
+        `/set_time YYYY-MM-DD HH:MM\n\n` +
+        `✅ Или запусти сразу:\n` +
+        `/confirm_vote`
+    );
 });
 
-// Алиасы для быстрого старта через слэш
+// Алиасы для быстрого выбора формата
 bot.command('start_6x6', async (ctx) => {
     const args = ctx.message.text.split(' ');
-    const date = args[1];
-    const time = args[2];
-    await startVoteWithFormat(ctx, '6x6', date, time);
+    // Если переданы дополнительные аргументы, используем старую логику
+    if (args[1]) {
+        const date = args[1];
+        const time = args[2];
+        await startVoteWithFormat(ctx, '6x6', date, time);
+    } else {
+        // Иначе используем новую логику выбора формата
+        ctx.message.text = '/start_vote 6x6';
+        await bot.handleUpdate({ message: ctx.message });
+    }
 });
 bot.command('start_7x7', async (ctx) => {
     const args = ctx.message.text.split(' ');
-    const date = args[1];
-    const time = args[2];
-    await startVoteWithFormat(ctx, '7x7', date, time);
+    if (args[1]) {
+        const date = args[1];
+        const time = args[2];
+        await startVoteWithFormat(ctx, '7x7', date, time);
+    } else {
+        ctx.message.text = '/start_vote 7x7';
+        await bot.handleUpdate({ message: ctx.message });
+    }
 });
 bot.command('start_8x8', async (ctx) => {
     const args = ctx.message.text.split(' ');
-    const date = args[1];
-    const time = args[2];
-    await startVoteWithFormat(ctx, '8x8', date, time);
+    if (args[1]) {
+        const date = args[1];
+        const time = args[2];
+        await startVoteWithFormat(ctx, '8x8', date, time);
+    } else {
+        ctx.message.text = '/start_vote 8x8';
+        await bot.handleUpdate({ message: ctx.message });
+    }
 });
 bot.command('start_9x9', async (ctx) => {
     const args = ctx.message.text.split(' ');
-    const date = args[1];
-    const time = args[2];
-    await startVoteWithFormat(ctx, '9x9', date, time);
+    if (args[1]) {
+        const date = args[1];
+        const time = args[2];
+        await startVoteWithFormat(ctx, '9x9', date, time);
+    } else {
+        ctx.message.text = '/start_vote 9x9';
+        await bot.handleUpdate({ message: ctx.message });
+    }
 });
 
 // 🎛 Обработка кнопок голосования
@@ -487,8 +552,147 @@ bot.command('end_vote', async (ctx) => {
     db.prepare(`UPDATE sessions
                 SET is_active = 0
                 WHERE id = ?`).run(active.id);
-    
+
+    // Очищаем черновик если он был
+    db.prepare(`DELETE FROM draft_sessions WHERE chat_id = ?`).run(ctx.chat.id);
+
     await ctx.reply('✅ Голосование завершено. Можно запустить новое: /start_vote 6x6 | 7x7 | 8x8 | 9x9');
+});
+
+// 🕐 Установить время для голосования
+bot.command('set_time', async (ctx) => {
+    const args = ctx.message.text.split(' ');
+    const date = args[1];
+    const time = args[2];
+
+    if (!date || !time) {
+        return ctx.reply('⚠️ Укажи дату и время: /set_time YYYY-MM-DD HH:MM\nПример: /set_time 2025-09-22 19:00');
+    }
+
+    const validDate = validateDate(date);
+    const validTime = validateTime(time);
+
+    if (!validDate) {
+        return ctx.reply('⚠️ Неверный формат даты. Используй YYYY-MM-DD (например: 2025-09-22)');
+    }
+    if (!validTime) {
+        return ctx.reply('⚠️ Неверный формат времени. Используй HH:MM (например: 19:00)');
+    }
+
+    try {
+        const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
+        const isAdmin = member.status === 'administrator' || member.status === 'creator';
+        if (!isAdmin) {
+            return ctx.reply('🚫 Настраивать голосование могут только администраторы.');
+        }
+    } catch (err) {
+        return ctx.reply('🚫 Не удалось проверить права. Попробуйте позже.');
+    }
+
+    // Проверяем, есть ли черновик для этого чата
+    const draft = db
+    .prepare(`SELECT * FROM draft_sessions WHERE chat_id = ?`)
+    .get(ctx.chat.id);
+
+    if (!draft) {
+        return ctx.reply('ℹ️ Сначала выбери формат командой /start_vote 6x6|7x7|8x8|9x9');
+    }
+
+    // Обновляем время в черновике
+    db.prepare(`UPDATE draft_sessions SET date = ?, time = ? WHERE chat_id = ?`)
+    .run(validDate, validTime, ctx.chat.id);
+
+    const dateTimeInfo = formatDateTime(validDate, validTime);
+    await ctx.reply(
+        `✅ Время установлено: ${dateTimeInfo}\n\n` +
+        `📋 Текущие настройки:\n` +
+        `⚽ Формат: ${draft.format} (нужно ${FORMATS[draft.format]} игроков)\n` +
+        `🗓️ ${dateTimeInfo}\n\n` +
+        `🚀 Запусти голосование:\n` +
+        `/confirm_vote`
+    );
+});
+
+// 🚫 Отменить настройку голосования
+bot.command('cancel_setup', async (ctx) => {
+    try {
+        const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
+        const isAdmin = member.status === 'administrator' || member.status === 'creator';
+        if (!isAdmin) {
+            return ctx.reply('🚫 Управлять настройками могут только администраторы.');
+        }
+    } catch (err) {
+        return ctx.reply('🚫 Не удалось проверить права. Попробуйте позже.');
+    }
+
+    const deleted = db.prepare(`DELETE FROM draft_sessions WHERE chat_id = ?`).run(ctx.chat.id);
+    if (deleted.changes > 0) {
+        await ctx.reply('✅ Настройка голосования отменена. Начни заново командой /start_vote');
+    } else {
+        await ctx.reply('ℹ️ Нет активной настройки для отмены.');
+    }
+});
+
+// ✅ Запустить голосование из черновика
+bot.command('confirm_vote', async (ctx) => {
+    try {
+        const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
+        const isAdmin = member.status === 'administrator' || member.status === 'creator';
+        if (!isAdmin) {
+            return ctx.reply('🚫 Запускать голосование могут только администраторы.');
+        }
+    } catch (err) {
+        return ctx.reply('🚫 Не удалось проверить права. Попробуйте позже.');
+    }
+
+    // Проверяем активное голосование
+    const existingActive = db
+    .prepare(`SELECT id, format, needed_players, date, time
+              FROM sessions
+              WHERE chat_id = ?
+                AND is_active = 1`)
+    .get(ctx.chat.id);
+    if (existingActive) {
+        const dateTimeInfo = formatDateTime(existingActive.date, existingActive.time);
+        const dateTimeText = dateTimeInfo ? `\n🗓️ ${dateTimeInfo}` : '';
+        return ctx.reply(
+            `⚠️ В этом чате уже запущено голосование (формат: ${ existingActive.format }).${dateTimeText}\n` +
+            `Чтобы начать новое, завершите текущее командой /end_vote.`,
+        );
+    }
+
+    // Получаем черновик
+    const draft = db
+    .prepare(`SELECT * FROM draft_sessions WHERE chat_id = ?`)
+    .get(ctx.chat.id);
+
+    if (!draft || !draft.format) {
+        return ctx.reply('ℹ️ Сначала выбери формат командой /start_vote 6x6|7x7|8x8|9x9');
+    }
+
+    // Создаем сессию голосования
+    const info = db
+    .prepare(
+        `INSERT INTO sessions (chat_id, format, needed_players, is_active, author_id, date, time)
+         VALUES (?, ?, ?, 1, ?, ?, ?)`,
+    )
+    .run(ctx.chat.id, draft.format, FORMATS[draft.format], ctx.from.id.toString(), draft.date, draft.time);
+    const sessionId = info.lastInsertRowid;
+
+    // Очищаем черновик
+    db.prepare(`DELETE FROM draft_sessions WHERE chat_id = ?`).run(ctx.chat.id);
+
+    const dateTimeInfo = formatDateTime(draft.date, draft.time);
+    const dateTimeText = dateTimeInfo ? `\n🗓️ ${dateTimeInfo}` : '';
+
+    return ctx.reply(
+        `⚽ Голосование началось!\nФормат: ${draft.format} (нужно ${FORMATS[draft.format]} игроков)${dateTimeText}\n\nКто играет?`,
+        Markup.inlineKeyboard([
+            [Markup.button.callback('✅ Играю', `vote:yes:${ sessionId }`)],
+            [Markup.button.callback('❌ Не играю', `vote:no:${ sessionId }`)],
+            [Markup.button.callback('🤔 Не знаю', `vote:maybe:${ sessionId }`)],
+        ]),
+    );
 });
 
 // 🕐 Изменить дату и время голосования
@@ -562,8 +766,18 @@ cron.schedule('0 */2 * * *', async () => {
         .all(session.id)
         .map((r) => r.user_id);
         
-        const members = db.prepare(`SELECT id, username, first_name, last_name
-                                    FROM members`).all();
+        // Проверяем, существуют ли новые колонки
+        let membersQuery = `SELECT id`;
+        try {
+            db.prepare(`SELECT first_name FROM members LIMIT 1`).get();
+            membersQuery += `, username, first_name, last_name`;
+        } catch (e) {
+            // Если колонки не существуют, используем старый формат
+            membersQuery += `, username`;
+        }
+        membersQuery += ` FROM members`;
+
+        const members = db.prepare(membersQuery).all();
 
         const notVotedMembers = members.filter((m) => !votedUserIds.includes(m.id));
         const mentions = notVotedMembers
@@ -591,5 +805,12 @@ app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${ PORT }`);
 });
 
+console.log('🚀 Запуск бота...');
+
 // ▶️ Запуск
-bot.launch();
+bot.launch().then(() => {
+    console.log('✅ Бот успешно запущен!');
+}).catch((err) => {
+    console.error('❌ Ошибка запуска бота:', err);
+    process.exit(1);
+});
