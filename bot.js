@@ -323,6 +323,53 @@ bot.on('left_chat_member', (ctx) => {
                 WHERE id = ?`).run(member.id.toString());
 });
 
+// 📝 Обработка текстовых сообщений с датой/временем для настройки
+bot.on('text', async (ctx) => {
+    const text = ctx.message.text.trim();
+
+    // Проверяем, есть ли активный черновик для этого чата
+    const draft = db
+    .prepare(`SELECT * FROM draft_sessions WHERE chat_id = ?`)
+    .get(ctx.chat.id);
+
+    if (!draft) return; // Нет активной настройки
+
+    // Проверяем, является ли сообщение датой и временем
+    const parts = text.split(' ');
+    if (parts.length === 2) {
+        const date = parts[0];
+        const time = parts[1];
+
+        const validDate = validateDate(date);
+        const validTime = validateTime(time);
+
+        if (validDate && validTime) {
+            try {
+                const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
+                const isAdmin = member.status === 'administrator' || member.status === 'creator';
+
+                if (isAdmin) {
+                    // Обновляем время в черновике
+                    db.prepare(`UPDATE draft_sessions SET date = ?, time = ? WHERE chat_id = ?`)
+                    .run(validDate, validTime, ctx.chat.id);
+
+                    const dateTimeInfo = formatDateTime(validDate, validTime);
+                    await ctx.reply(
+                        `✅ Время установлено: ${dateTimeInfo}\n\n` +
+                        `📋 Текущие настройки:\n` +
+                        `⚽ Формат: ${draft.format} (нужно ${FORMATS[draft.format]} игроков)\n` +
+                        `🗓️ ${dateTimeInfo}\n\n` +
+                        `🚀 Запусти голосование:\n` +
+                        `/confirm_vote`
+                    );
+                }
+            } catch (err) {
+                // Игнорируем ошибки проверки прав
+            }
+        }
+    }
+});
+
 // 🏁 Команда выбора формата игры
 bot.command('start_vote', async (ctx) => {
     const args = ctx.message.text.split(' ');
@@ -350,9 +397,10 @@ bot.command('start_vote', async (ctx) => {
 
     await ctx.reply(
         `⚽ Формат выбран: ${fmt} (нужно ${FORMATS[fmt]} игроков)\n\n` +
-        `📅 Установи время командой:\n` +
-        `/set_time YYYY-MM-DD HH:MM\n\n` +
-        `✅ Или запусти сразу:\n` +
+        `📅 Установи время:\n` +
+        `• Командой: /set_time YYYY-MM-DD HH:MM\n` +
+        `• Или просто напиши: 2025-09-22 19:00\n\n` +
+        `✅ Запусти голосование:\n` +
         `/confirm_vote`
     );
 });
@@ -498,7 +546,7 @@ bot.on('callback_query', async (ctx) => {
                 parse_mode: 'Markdown',
                 ...Markup.inlineKeyboard([
                     [Markup.button.callback('✅ Играю', `vote:yes:${ sessionId }`)],
-                    [Markup.button.callback('❌ Не знаю', `vote:maybe:${ sessionId }`)],
+                    [Markup.button.callback('🤔 Не знаю', `vote:maybe:${ sessionId }`)],
                     [Markup.button.callback('❌ Не играю', `vote:no:${ sessionId }`)],
                 ])
             }
