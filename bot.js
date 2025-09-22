@@ -35,7 +35,7 @@ function formatPlayerMention(member) {
 }
 
 // 📝 Функция для красивого форматирования списка игроков
-function formatPlayersList(players, maxDisplay = 8) {
+function formatPlayersList(players, maxDisplay = 100) {
     if (!players || players.length === 0) {
         return 'нет';
     }
@@ -189,6 +189,7 @@ migrateTable('members', 'first_name', 'TEXT');
 migrateTable('members', 'last_name', 'TEXT');
 migrateTable('sessions', 'date', 'TEXT');
 migrateTable('sessions', 'time', 'TEXT');
+migrateTable('sessions', 'message_id', 'INTEGER');
 
 db.prepare(
     `CREATE TABLE IF NOT EXISTS votes
@@ -291,7 +292,7 @@ async function startVoteWithFormat(ctx, fmt, date = null, time = null) {
     const dateTimeInfo = formatDateTime(validDate, validTime);
     const dateTimeText = dateTimeInfo ? `\n🗓️ ${dateTimeInfo}` : '';
 
-    return ctx.reply(
+    const message = await ctx.reply(
         `⚽ Голосование началось!\nФормат: ${ fmt } (нужно ${ FORMATS[fmt] } игроков)${dateTimeText}\n\nКто играет?`,
         Markup.inlineKeyboard([
             [Markup.button.callback('✅ Играю', `vote:yes:${ sessionId }`)],
@@ -299,6 +300,9 @@ async function startVoteWithFormat(ctx, fmt, date = null, time = null) {
             [Markup.button.callback('🤔 Не знаю', `vote:maybe:${ sessionId }`)],
         ]),
     );
+
+    // Сохраняем ID сообщения голосования
+    db.prepare(`UPDATE sessions SET message_id = ? WHERE id = ?`).run(message.message_id, sessionId);
 }
 
 // 📌 Добавляем новых участников в БД
@@ -748,7 +752,7 @@ bot.command('confirm_vote', async (ctx) => {
     const dateTimeInfo = formatDateTime(draft.date, draft.time);
     const dateTimeText = dateTimeInfo ? `\n🗓️ ${dateTimeInfo}` : '';
 
-    return ctx.reply(
+    const message = await ctx.reply(
         `⚽ Голосование началось!\nФормат: ${draft.format} (нужно ${FORMATS[draft.format]} игроков)${dateTimeText}\n\nКто играет?`,
         Markup.inlineKeyboard([
             [Markup.button.callback('✅ Играю', `vote:yes:${ sessionId }`)],
@@ -756,6 +760,9 @@ bot.command('confirm_vote', async (ctx) => {
             [Markup.button.callback('🤔 Не знаю', `vote:maybe:${ sessionId }`)],
         ]),
     );
+
+    // Сохраняем ID сообщения голосования
+    db.prepare(`UPDATE sessions SET message_id = ? WHERE id = ?`).run(message.message_id, sessionId);
 });
 
 // 🕐 Изменить дату и время голосования
@@ -812,15 +819,15 @@ bot.command('set_datetime', async (ctx) => {
 // 🔔 Напоминания каждые 2 часа
 cron.schedule('0 */2 * * *', async () => {
     const activeSessions = db
-    .prepare(`SELECT id, chat_id
+    .prepare(`SELECT id, chat_id, message_id
               FROM sessions
               WHERE is_active = 1`)
     .all();
-    
+
     if (!activeSessions || activeSessions.length === 0) {
         return;
     }
-    
+
     for (const session of activeSessions) {
         const votedUserIds = db
         .prepare(`SELECT user_id
@@ -828,7 +835,7 @@ cron.schedule('0 */2 * * *', async () => {
                   WHERE session_id = ?`)
         .all(session.id)
         .map((r) => r.user_id);
-        
+
         // Проверяем, существуют ли новые колонки
         let membersQuery = `SELECT id`;
         try {
@@ -849,9 +856,16 @@ cron.schedule('0 */2 * * *', async () => {
         .join(', ');
 
         if (mentions.length > 0) {
+            // Создаем ссылку на голосование
+            let voteLink = '';
+            if (session.message_id) {
+                const chatId = session.chat_id.toString().replace('-', ''); // Убираем минус для супергрупп
+                voteLink = ` [Голосование](https://t.me/c/${chatId}/${session.message_id})`;
+            }
+
             await bot.telegram.sendMessage(
                 session.chat_id,
-                `⏰ Напоминание! Проголосуйте, если ещё не отметились.\n` +
+                `⏰ Напоминание! Проголосуйте, если ещё не отметились.${voteLink}\n` +
                 mentions,
                 { parse_mode: 'Markdown' }
             );
