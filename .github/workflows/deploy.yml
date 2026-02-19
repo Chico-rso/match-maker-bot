@@ -1,0 +1,66 @@
+name: Deploy Bot
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      SSH_PORT: ${{ vars.SSH_PORT }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+      PM2_APP_NAME: ${{ vars.PM2_APP_NAME }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        run: |
+          [[ -n "${SSH_HOST}" ]] || (echo "Missing secret: SSH_HOST" && exit 1)
+          [[ -n "${SSH_USER}" ]] || (echo "Missing secret: SSH_USER" && exit 1)
+          [[ -n "${SSH_PRIVATE_KEY}" ]] || (echo "Missing secret: SSH_PRIVATE_KEY" && exit 1)
+
+      - name: Prepare deploy variables
+        run: |
+          echo "SSH_PORT=${SSH_PORT:-22}" >> "$GITHUB_ENV"
+          echo "DEPLOY_PATH=${DEPLOY_PATH:-/root/match-maker-bot}" >> "$GITHUB_ENV"
+          echo "PM2_APP_NAME=${PM2_APP_NAME:-bot}" >> "$GITHUB_ENV"
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: Ensure target directory exists
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "mkdir -p '$DEPLOY_PATH'"
+
+      - name: Sync project files
+        run: |
+          rsync -az \
+            --exclude ".git/" \
+            --exclude ".github/" \
+            --exclude ".idea/" \
+            --exclude ".env" \
+            --exclude "node_modules/" \
+            --exclude "bot.db" \
+            -e "ssh -i ~/.ssh/deploy_key -p $SSH_PORT" \
+            ./ "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/"
+
+      - name: Run remote deploy script
+        run: |
+          ssh -i ~/.ssh/deploy_key -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "cd '$DEPLOY_PATH' && chmod +x scripts/deploy.sh && DEPLOY_PATH='$DEPLOY_PATH' PM2_APP_NAME='$PM2_APP_NAME' bash scripts/deploy.sh"
