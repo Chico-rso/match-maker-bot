@@ -95,6 +95,54 @@ function validateDate(dateStr) {
     return dateStr;
 }
 
+function toISODate(dateObj) {
+    const year = dateObj.getFullYear();
+    const month = String(dateObj.getMonth() + 1).padStart(2, '0');
+    const day = String(dateObj.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+}
+
+// 📝 Гибкий парсер даты: YYYY-MM-DD, DD.MM, DD.MM.YYYY, сегодня/завтра/послезавтра
+function parseDateInput(dateInput) {
+    if (!dateInput) return null;
+
+    const raw = dateInput.trim().toLowerCase();
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    if (raw === 'today' || raw === 'сегодня') {
+        return toISODate(today);
+    }
+    if (raw === 'tomorrow' || raw === 'завтра') {
+        const d = new Date(today);
+        d.setDate(d.getDate() + 1);
+        return toISODate(d);
+    }
+    if (raw === 'послезавтра') {
+        const d = new Date(today);
+        d.setDate(d.getDate() + 2);
+        return toISODate(d);
+    }
+
+    const dotted = raw.match(/^(\d{2})\.(\d{2})(?:\.(\d{4}))?$/);
+    if (dotted) {
+        const day = Number(dotted[1]);
+        const month = Number(dotted[2]);
+        let year = dotted[3] ? Number(dotted[3]) : today.getFullYear();
+
+        if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+
+        let normalized = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+        if (!validateDate(normalized) && !dotted[3]) {
+            year += 1;
+            normalized = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+        }
+        return validateDate(normalized);
+    }
+
+    return validateDate(raw);
+}
+
 // 📝 Функция для валидации времени в формате HH:MM
 function validateTime(timeStr) {
     if (!timeStr) return null;
@@ -105,6 +153,30 @@ function validateTime(timeStr) {
     if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
 
     return timeStr;
+}
+
+function resolveDateTimeStatus(status, date, time) {
+    if (status === 'tentative' || status === 'confirmed') {
+        return status;
+    }
+    return (date && time) ? 'confirmed' : 'tentative';
+}
+
+function formatScheduleLine(date, time, status) {
+    const resolvedStatus = resolveDateTimeStatus(status, date, time);
+    const dateTimeInfo = formatDateTime(date, time);
+
+    if (resolvedStatus === 'tentative') {
+        if (dateTimeInfo) {
+            return `⏳ Предварительно: ${dateTimeInfo}`;
+        }
+        return '⏳ Предварительно: время уточняется';
+    }
+
+    if (dateTimeInfo) {
+        return `✅ Подтверждено: ${dateTimeInfo}`;
+    }
+    return '✅ Подтверждено: время будет объявлено';
 }
 
 // 📝 Функция для форматирования даты и времени
@@ -190,6 +262,7 @@ migrateTable('members', 'last_name', 'TEXT');
 migrateTable('sessions', 'date', 'TEXT');
 migrateTable('sessions', 'time', 'TEXT');
 migrateTable('sessions', 'message_id', 'INTEGER');
+migrateTable('sessions', 'datetime_status', 'TEXT');
 
 db.prepare(
     `CREATE TABLE IF NOT EXISTS votes
@@ -229,30 +302,53 @@ db.prepare(
     )`,
 ).run();
 
+migrateTable('draft_sessions', 'datetime_status', 'TEXT');
+
 const bot = new Telegraf(TOKEN);
 
 // Регистрируем меню команд с готовыми опциями
 bot.telegram.setMyCommands([
+    {command: 'start', description: 'Показать быстрый гид по боту'},
     {command: 'start_vote', description: 'Выбрать формат игры: /start_vote 6x6|7x7|8x8|9x9'},
-    {command: 'set_time', description: 'Установить время: /set_time YYYY-MM-DD HH:MM'},
+    {command: 'set_time', description: 'Предв. время: /set_time сегодня 19:00'},
+    {command: 'set_tentative', description: 'Сделать время предварительным'},
+    {command: 'confirm_datetime', description: 'Подтвердить точные дату/время'},
     {command: 'confirm_vote', description: 'Запустить голосование'},
     {command: 'cancel_setup', description: 'Отменить настройку голосования'},
     {command: 'set_datetime', description: 'Изменить дату/время: /set_datetime YYYY-MM-DD HH:MM'},
     {command: 'end_vote', description: 'Завершить текущее голосование'},
 ]);
 
+const HELP_TEXT =
+    `🤖 Это бот для набора игроков на матч.\n\n` +
+    `Быстрый сценарий:\n` +
+    `1) /start_vote 6x6|7x7|8x8|9x9\n` +
+    `2) /set_time сегодня 19:00 (можно: завтра, 22.09, 2026-02-21)\n` +
+    `3) /confirm_vote\n\n` +
+    `Если время пока не точное:\n` +
+    `• /set_tentative [дата] [время]\n` +
+    `Когда время стало точным:\n` +
+    `• /confirm_datetime YYYY-MM-DD HH:MM\n\n` +
+    `Во время активного сбора:\n` +
+    `• /set_datetime YYYY-MM-DD HH:MM — поменять дату/время\n` +
+    `• /end_vote — завершить голосование`;
+
+bot.start((ctx) => ctx.reply(HELP_TEXT));
+bot.command('help', (ctx) => ctx.reply(HELP_TEXT));
+
 // Хелпер старта голосования c проверками
 async function startVoteWithFormat(ctx, fmt, date = null, time = null) {
     if (!fmt || !FORMATS[fmt]) {
-        return ctx.reply('⚠️ Укажи формат: /start_vote 6x6 | 7x7 | 8x8 | 9x9 [дата YYYY-MM-DD] [время HH:MM]');
+        return ctx.reply('⚠️ Укажи формат: /start_vote 6x6 | 7x7 | 8x8 | 9x9 [дата] [время HH:MM]');
     }
 
     // Валидация даты и времени
-    const validDate = validateDate(date);
+    const validDate = parseDateInput(date);
     const validTime = validateTime(time);
+    const datetimeStatus = (validDate && validTime) ? 'confirmed' : 'tentative';
 
     if (date && !validDate) {
-        return ctx.reply('⚠️ Неверный формат даты. Используй YYYY-MM-DD (например: 2025-09-22)');
+        return ctx.reply('⚠️ Неверный формат даты. Примеры: 2026-02-21, 21.02, сегодня, завтра');
     }
     if (time && !validTime) {
         return ctx.reply('⚠️ Неверный формат времени. Используй HH:MM (например: 19:00)');
@@ -268,32 +364,30 @@ async function startVoteWithFormat(ctx, fmt, date = null, time = null) {
         return ctx.reply('🚫 Не удалось проверить права. Попробуйте позже.');
     }
     const existingActive = db
-    .prepare(`SELECT id, format, needed_players, date, time
+    .prepare(`SELECT id, format, needed_players, date, time, datetime_status
               FROM sessions
               WHERE chat_id = ?
                 AND is_active = 1`)
     .get(ctx.chat.id);
     if (existingActive) {
-        const dateTimeInfo = formatDateTime(existingActive.date, existingActive.time);
-        const dateTimeText = dateTimeInfo ? `\n🗓️ ${dateTimeInfo}` : '';
+        const scheduleLine = formatScheduleLine(existingActive.date, existingActive.time, existingActive.datetime_status);
         return ctx.reply(
-            `⚠️ В этом чате уже запущено голосование (формат: ${ existingActive.format }).${dateTimeText}\n` +
+            `⚠️ В этом чате уже запущено голосование (формат: ${ existingActive.format }).\n${scheduleLine}\n` +
             `Чтобы начать новое, завершите текущее командой /end_vote.`,
         );
     }
     const info = db
     .prepare(
-        `INSERT INTO sessions (chat_id, format, needed_players, is_active, author_id, date, time)
-         VALUES (?, ?, ?, 1, ?, ?, ?)`,
+        `INSERT INTO sessions (chat_id, format, needed_players, is_active, author_id, date, time, datetime_status)
+         VALUES (?, ?, ?, 1, ?, ?, ?, ?)`,
     )
-    .run(ctx.chat.id, fmt, FORMATS[fmt], ctx.from.id.toString(), validDate, validTime);
+    .run(ctx.chat.id, fmt, FORMATS[fmt], ctx.from.id.toString(), validDate, validTime, datetimeStatus);
     const sessionId = info.lastInsertRowid;
 
-    const dateTimeInfo = formatDateTime(validDate, validTime);
-    const dateTimeText = dateTimeInfo ? `\n🗓️ ${dateTimeInfo}` : '';
+    const scheduleLine = formatScheduleLine(validDate, validTime, datetimeStatus);
 
     const message = await ctx.reply(
-        `⚽ Голосование началось!\nФормат: ${ fmt } (нужно ${ FORMATS[fmt] } игроков)${dateTimeText}\n\nКто играет?`,
+        `⚽ Голосование началось!\nФормат: ${ fmt } (нужно ${ FORMATS[fmt] } игроков)\n${scheduleLine}\n\nКто играет?`,
         Markup.inlineKeyboard([
             [Markup.button.callback('✅ Играю', `vote:yes:${ sessionId }`)],
             [Markup.button.callback('❌ Не играю', `vote:no:${ sessionId }`)],
@@ -303,6 +397,125 @@ async function startVoteWithFormat(ctx, fmt, date = null, time = null) {
 
     // Сохраняем ID сообщения голосования
     db.prepare(`UPDATE sessions SET message_id = ? WHERE id = ?`).run(message.message_id, sessionId);
+
+    await sendVoteStartNotification(ctx.chat.id, sessionId, message.message_id);
+}
+
+// 📣 Мгновенное уведомление всем, кто ещё не проголосовал, при старте голосования
+async function sendVoteStartNotification(chatId, sessionId, messageId) {
+    const votedUserIds = db
+    .prepare(`SELECT user_id
+              FROM votes
+              WHERE session_id = ?`)
+    .all(sessionId)
+    .map((r) => r.user_id);
+
+    // Поддержка старой и новой схемы members
+    let membersQuery = `SELECT id`;
+    try {
+        db.prepare(`SELECT first_name FROM members LIMIT 1`).get();
+        membersQuery += `, username, first_name, last_name`;
+    } catch (e) {
+        membersQuery += `, username`;
+    }
+    membersQuery += ` FROM members`;
+
+    const members = db.prepare(membersQuery).all();
+    const notVotedMembers = members.filter((m) => !votedUserIds.includes(m.id));
+    const mentions = notVotedMembers
+    .map(formatPlayerMention)
+    .filter((s) => s.length > 0)
+    .join(', ');
+
+    if (!mentions) {
+        return;
+    }
+
+    let voteLink = '';
+    if (messageId) {
+        const normalizedChatId = chatId.toString().replace('-', '');
+        voteLink = ` [Открыть голосование](https://t.me/c/${normalizedChatId}/${messageId})`;
+    }
+
+    try {
+        await bot.telegram.sendMessage(
+            chatId,
+            `📢 Голосование запущено! Пожалуйста, отметьтесь.${voteLink}\n${mentions}`,
+            { parse_mode: 'Markdown' },
+        );
+    } catch (err) {
+        console.error('sendVoteStartNotification failed:', err?.message || err);
+    }
+}
+
+function getSessionVoteLists(sessionId) {
+    const yes = db
+    .prepare(`SELECT m.id, m.username, m.first_name, m.last_name
+              FROM votes v
+                        JOIN members m ON v.user_id = m.id
+              WHERE v.vote = 'yes'
+                AND v.session_id = ?`)
+    .all(sessionId);
+
+    const no = db
+    .prepare(`SELECT m.id, m.username, m.first_name, m.last_name
+              FROM votes v
+                        JOIN members m ON v.user_id = m.id
+              WHERE v.vote = 'no'
+                AND v.session_id = ?`)
+    .all(sessionId);
+
+    const maybe = db
+    .prepare(`SELECT m.id, m.username, m.first_name, m.last_name
+              FROM votes v
+                        JOIN members m ON v.user_id = m.id
+              WHERE v.vote = 'maybe'
+                AND v.session_id = ?`)
+    .all(sessionId);
+
+    return { yes, no, maybe };
+}
+
+async function refreshVoteMessage(sessionId) {
+    const session = db.prepare(`SELECT * FROM sessions WHERE id = ?`).get(sessionId);
+    if (!session) {
+        return { totalYes: 0 };
+    }
+
+    const { yes, no, maybe } = getSessionVoteLists(sessionId);
+    const totalYes = yes.length;
+    const scheduleLine = formatScheduleLine(session.date, session.time, session.datetime_status);
+
+    if (session.message_id) {
+        try {
+            await bot.telegram.editMessageText(
+                session.chat_id,
+                session.message_id,
+                undefined,
+                `⚽ Формат: ${ session.format }\n` +
+                `${scheduleLine}\n` +
+                `✅ Играют: ${ formatPlayersList(yes) }\n` +
+                `❌ Не играют: ${ formatPlayersList(no) }\n` +
+                `🤔 Думают: ${ formatPlayersList(maybe) }\n\n` +
+                `Игроков нужно: ${ session.needed_players }, уже есть: ${ totalYes }`,
+                {
+                    parse_mode: 'Markdown',
+                    ...Markup.inlineKeyboard([
+                        [Markup.button.callback('✅ Играю', `vote:yes:${ session.id }`)],
+                        [Markup.button.callback('🤔 Не знаю', `vote:maybe:${ session.id }`)],
+                        [Markup.button.callback('❌ Не играю', `vote:no:${ session.id }`)],
+                    ]),
+                },
+            );
+        } catch (err) {
+            const desc = err?.response?.description || err?.description || err?.message || '';
+            if (!desc.includes('message is not modified')) {
+                console.error('refreshVoteMessage failed:', err);
+            }
+        }
+    }
+
+    return { totalYes };
 }
 
 // 📌 Добавляем новых участников в БД
@@ -353,11 +566,11 @@ bot.use(async (ctx, next) => {
     // Проверяем, является ли сообщение датой и временем
     const parts = text.split(' ');
     if (parts.length === 2) {
-        const date = parts[0];
-        const time = parts[1];
+        const dateInput = parts[0];
+        const timeInput = parts[1];
 
-        const validDate = validateDate(date);
-        const validTime = validateTime(time);
+        const validDate = parseDateInput(dateInput);
+        const validTime = validateTime(timeInput);
 
         if (validDate && validTime) {
             try {
@@ -366,15 +579,15 @@ bot.use(async (ctx, next) => {
 
                 if (isAdmin) {
                     // Обновляем время в черновике
-                    db.prepare(`UPDATE draft_sessions SET date = ?, time = ? WHERE chat_id = ?`)
+                    db.prepare(`UPDATE draft_sessions SET date = ?, time = ?, datetime_status = 'tentative' WHERE chat_id = ?`)
                     .run(validDate, validTime, ctx.chat.id);
 
-                    const dateTimeInfo = formatDateTime(validDate, validTime);
+                    const scheduleLine = formatScheduleLine(validDate, validTime, 'tentative');
                     await ctx.reply(
-                        `✅ Время установлено: ${dateTimeInfo}\n\n` +
+                        `✅ Предварительное время установлено.\n\n` +
                         `📋 Текущие настройки:\n` +
                         `⚽ Формат: ${draft.format} (нужно ${FORMATS[draft.format]} игроков)\n` +
-                        `🗓️ ${dateTimeInfo}\n\n` +
+                        `${scheduleLine}\n\n` +
                         `🚀 Запусти голосование:\n` +
                         `/confirm_vote`
                     );
@@ -395,7 +608,12 @@ bot.command('start_vote', async (ctx) => {
     const fmt = args[1];
 
     if (!fmt || !FORMATS[fmt]) {
-        return ctx.reply('⚠️ Укажи формат: /start_vote 6x6 | 7x7 | 8x8 | 9x9\n\nПосле этого:\n/set_time YYYY-MM-DD HH:MM\n/confirm_vote');
+        return ctx.reply(
+            '⚠️ Укажи формат: /start_vote 6x6 | 7x7 | 8x8 | 9x9\n\n' +
+            'Дальше:\n' +
+            '1) /set_time сегодня 19:00 (или завтра / 22.09 / 2026-02-21)\n' +
+            '2) /confirm_vote',
+        );
     }
 
     try {
@@ -410,15 +628,16 @@ bot.command('start_vote', async (ctx) => {
 
     // Сохраняем формат в черновик
     db.prepare(
-        `INSERT OR REPLACE INTO draft_sessions (chat_id, format)
-         VALUES (?, ?)`,
+        `INSERT OR REPLACE INTO draft_sessions (chat_id, format, datetime_status)
+         VALUES (?, ?, 'tentative')`,
     ).run(ctx.chat.id, fmt);
 
     await ctx.reply(
         `⚽ Формат выбран: ${fmt} (нужно ${FORMATS[fmt]} игроков)\n\n` +
-        `📅 Установи время:\n` +
-        `• Командой: /set_time YYYY-MM-DD HH:MM\n` +
-        `• Или просто напиши: 2025-09-22 19:00\n\n` +
+        `📅 Установи предварительное время:\n` +
+        `• Командой: /set_time сегодня 19:00\n` +
+        `• Или просто напиши: завтра 19:00\n` +
+        `• Можно сразу точное: /confirm_datetime 2026-02-21 19:00\n\n` +
         `✅ Запусти голосование:\n` +
         `/confirm_vote`
     );
@@ -473,13 +692,15 @@ bot.command('start_9x9', async (ctx) => {
 });
 
 // 🎛 Обработка кнопок голосования
-bot.on('callback_query', async (ctx) => {
-    const [action, vote, sessionId] = ctx.callbackQuery.data.split(':');
-    
-    if (action !== 'vote') return;
-    
+bot.on('callback_query', async (ctx, next) => {
+    const [action, vote, sessionId] = (ctx.callbackQuery?.data || '').split(':');
+
+    if (action !== 'vote') {
+        return next();
+    }
+
     const activeSession = db
-    .prepare(`SELECT *, date, time
+    .prepare(`SELECT *
               FROM sessions
               WHERE id = ?
                 AND is_active = 1`)
@@ -516,67 +737,9 @@ bot.on('callback_query', async (ctx) => {
         `INSERT
         OR REPLACE INTO votes (user_id, vote, session_id) VALUES (?, ?, ?)`,
     ).run(userId, vote, sessionId);
-    
-    // Считаем голоса
-    const votes = db
-    .prepare(`SELECT vote, COUNT(*) as count
-              FROM votes
-              WHERE session_id = ?
-              GROUP BY vote`)
-    .all(sessionId);
-    
-    const yes = db
-    .prepare(`SELECT m.id, m.username, m.first_name, m.last_name
-              FROM votes v
-                        JOIN members m ON v.user_id = m.id
-              WHERE v.vote = 'yes'
-                AND v.session_id = ?`)
-    .all(sessionId);
 
-    const no = db
-    .prepare(`SELECT m.id, m.username, m.first_name, m.last_name
-              FROM votes v
-                        JOIN members m ON v.user_id = m.id
-              WHERE v.vote = 'no'
-                AND v.session_id = ?`)
-    .all(sessionId);
+    const { totalYes } = await refreshVoteMessage(sessionId);
 
-    const maybe = db
-    .prepare(`SELECT m.id, m.username, m.first_name, m.last_name
-              FROM votes v
-                        JOIN members m ON v.user_id = m.id
-              WHERE v.vote = 'maybe'
-                AND v.session_id = ?`)
-    .all(sessionId);
-    
-    const totalYes = yes.length;
-    
-    const dateTimeInfo = formatDateTime(activeSession.date, activeSession.time);
-    const dateTimeText = dateTimeInfo ? `\n🗓️ ${dateTimeInfo}` : '';
-
-    try {
-        await ctx.editMessageText(
-            `⚽ Формат: ${ activeSession.format }${dateTimeText}\n` +
-            `✅ Играют: ${ formatPlayersList(yes) }\n` +
-            `❌ Не играют: ${ formatPlayersList(no) }\n` +
-            `🤔 Думают: ${ formatPlayersList(maybe) }\n\n` +
-            `Игроков нужно: ${ activeSession.needed_players }, уже есть: ${ totalYes }`,
-            {
-                parse_mode: 'Markdown',
-                ...Markup.inlineKeyboard([
-                    [Markup.button.callback('✅ Играю', `vote:yes:${ sessionId }`)],
-                    [Markup.button.callback('🤔 Не знаю', `vote:maybe:${ sessionId }`)],
-                    [Markup.button.callback('❌ Не играю', `vote:no:${ sessionId }`)],
-                ])
-            }
-        );
-    } catch (err) {
-        const desc = err?.response?.description || err?.description || err?.message || '';
-        if (!desc.includes('message is not modified')) {
-            console.error('editMessageText failed:', err);
-        }
-    }
-    
     if (totalYes >= activeSession.needed_players) {
         db.prepare(`UPDATE sessions
                     SET is_active = 0
@@ -629,18 +792,21 @@ bot.command('end_vote', async (ctx) => {
 // 🕐 Установить время для голосования
 bot.command('set_time', async (ctx) => {
     const args = ctx.message.text.split(' ');
-    const date = args[1];
-    const time = args[2];
+    const dateInput = args[1];
+    const timeInput = args[2];
 
-    if (!date || !time) {
-        return ctx.reply('⚠️ Укажи дату и время: /set_time YYYY-MM-DD HH:MM\nПример: /set_time 2025-09-22 19:00');
+    if (!dateInput || !timeInput) {
+        return ctx.reply(
+            '⚠️ Укажи дату и время: /set_time <дата> <время>\n' +
+            'Примеры: /set_time сегодня 19:00, /set_time завтра 20:30, /set_time 21.02 19:00',
+        );
     }
 
-    const validDate = validateDate(date);
-    const validTime = validateTime(time);
+    const validDate = parseDateInput(dateInput);
+    const validTime = validateTime(timeInput);
 
     if (!validDate) {
-        return ctx.reply('⚠️ Неверный формат даты. Используй YYYY-MM-DD (например: 2025-09-22)');
+        return ctx.reply('⚠️ Неверный формат даты. Примеры: 2026-02-21, 21.02, сегодня, завтра');
     }
     if (!validTime) {
         return ctx.reply('⚠️ Неверный формат времени. Используй HH:MM (например: 19:00)');
@@ -665,19 +831,158 @@ bot.command('set_time', async (ctx) => {
         return ctx.reply('ℹ️ Сначала выбери формат командой /start_vote 6x6|7x7|8x8|9x9');
     }
 
-    // Обновляем время в черновике
-    db.prepare(`UPDATE draft_sessions SET date = ?, time = ? WHERE chat_id = ?`)
+    // Обновляем предварительное время в черновике
+    db.prepare(`UPDATE draft_sessions SET date = ?, time = ?, datetime_status = 'tentative' WHERE chat_id = ?`)
     .run(validDate, validTime, ctx.chat.id);
 
-    const dateTimeInfo = formatDateTime(validDate, validTime);
+    const scheduleLine = formatScheduleLine(validDate, validTime, 'tentative');
     await ctx.reply(
-        `✅ Время установлено: ${dateTimeInfo}\n\n` +
+        `✅ Предварительное время установлено.\n\n` +
         `📋 Текущие настройки:\n` +
         `⚽ Формат: ${draft.format} (нужно ${FORMATS[draft.format]} игроков)\n` +
-        `🗓️ ${dateTimeInfo}\n\n` +
+        `${scheduleLine}\n\n` +
+        `Если время уже точное: /confirm_datetime YYYY-MM-DD HH:MM\n\n` +
         `🚀 Запусти голосование:\n` +
         `/confirm_vote`
     );
+});
+
+// ⏳ Перевести время в предварительное (для черновика или активного голосования)
+bot.command('set_tentative', async (ctx) => {
+    const args = ctx.message.text.split(' ');
+    const dateInput = args[1];
+    const timeInput = args[2];
+
+    const validDate = dateInput ? parseDateInput(dateInput) : null;
+    const validTime = timeInput ? validateTime(timeInput) : null;
+
+    if (dateInput && !validDate) {
+        return ctx.reply('⚠️ Неверный формат даты. Примеры: 2026-02-21, 21.02, сегодня, завтра');
+    }
+    if (timeInput && !validTime) {
+        return ctx.reply('⚠️ Неверный формат времени. Используй HH:MM (например: 19:00)');
+    }
+
+    try {
+        const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
+        const isAdmin = member.status === 'administrator' || member.status === 'creator';
+        if (!isAdmin) {
+            return ctx.reply('🚫 Изменять статус времени могут только администраторы.');
+        }
+    } catch (err) {
+        return ctx.reply('🚫 Не удалось проверить права. Попробуйте позже.');
+    }
+
+    const draft = db
+    .prepare(`SELECT * FROM draft_sessions WHERE chat_id = ?`)
+    .get(ctx.chat.id);
+
+    if (draft) {
+        const nextDate = dateInput ? validDate : draft.date;
+        const nextTime = timeInput ? validTime : draft.time;
+
+        db.prepare(`UPDATE draft_sessions SET date = ?, time = ?, datetime_status = 'tentative' WHERE chat_id = ?`)
+        .run(nextDate, nextTime, ctx.chat.id);
+
+        const scheduleLine = formatScheduleLine(nextDate, nextTime, 'tentative');
+        return ctx.reply(
+            `⏳ Время отмечено как предварительное.\n\n` +
+            `📋 Текущие настройки:\n` +
+            `⚽ Формат: ${draft.format} (нужно ${FORMATS[draft.format]} игроков)\n` +
+            `${scheduleLine}\n\n` +
+            `🚀 Запусти голосование:\n` +
+            `/confirm_vote`,
+        );
+    }
+
+    const activeSession = db
+    .prepare(`SELECT id, date, time
+              FROM sessions
+              WHERE chat_id = ?
+                AND is_active = 1`)
+    .get(ctx.chat.id);
+
+    if (!activeSession) {
+        return ctx.reply('ℹ️ Нет ни черновика, ни активного голосования. Начни с /start_vote');
+    }
+
+    const nextDate = dateInput ? validDate : activeSession.date;
+    const nextTime = timeInput ? validTime : activeSession.time;
+
+    db.prepare(`UPDATE sessions SET date = ?, time = ?, datetime_status = 'tentative' WHERE id = ?`)
+    .run(nextDate, nextTime, activeSession.id);
+
+    await refreshVoteMessage(activeSession.id);
+    const scheduleLine = formatScheduleLine(nextDate, nextTime, 'tentative');
+    return ctx.reply(`⏳ В активном голосовании время стало предварительным.\n${scheduleLine}`);
+});
+
+// ✅ Подтвердить точную дату и время (для черновика или активного голосования)
+bot.command('confirm_datetime', async (ctx) => {
+    const args = ctx.message.text.split(' ');
+    const dateInput = args[1];
+    const timeInput = args[2];
+
+    if (!dateInput || !timeInput) {
+        return ctx.reply('⚠️ Укажи точные дату и время: /confirm_datetime YYYY-MM-DD HH:MM');
+    }
+
+    const validDate = parseDateInput(dateInput);
+    const validTime = validateTime(timeInput);
+
+    if (!validDate) {
+        return ctx.reply('⚠️ Неверный формат даты. Примеры: 2026-02-21, 21.02, сегодня, завтра');
+    }
+    if (!validTime) {
+        return ctx.reply('⚠️ Неверный формат времени. Используй HH:MM (например: 19:00)');
+    }
+
+    try {
+        const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
+        const isAdmin = member.status === 'administrator' || member.status === 'creator';
+        if (!isAdmin) {
+            return ctx.reply('🚫 Подтверждать дату/время могут только администраторы.');
+        }
+    } catch (err) {
+        return ctx.reply('🚫 Не удалось проверить права. Попробуйте позже.');
+    }
+
+    const draft = db
+    .prepare(`SELECT * FROM draft_sessions WHERE chat_id = ?`)
+    .get(ctx.chat.id);
+
+    if (draft) {
+        db.prepare(`UPDATE draft_sessions SET date = ?, time = ?, datetime_status = 'confirmed' WHERE chat_id = ?`)
+        .run(validDate, validTime, ctx.chat.id);
+
+        const scheduleLine = formatScheduleLine(validDate, validTime, 'confirmed');
+        return ctx.reply(
+            `✅ Точное время подтверждено.\n\n` +
+            `📋 Текущие настройки:\n` +
+            `⚽ Формат: ${draft.format} (нужно ${FORMATS[draft.format]} игроков)\n` +
+            `${scheduleLine}\n\n` +
+            `🚀 Запусти голосование:\n` +
+            `/confirm_vote`,
+        );
+    }
+
+    const activeSession = db
+    .prepare(`SELECT id
+              FROM sessions
+              WHERE chat_id = ?
+                AND is_active = 1`)
+    .get(ctx.chat.id);
+
+    if (!activeSession) {
+        return ctx.reply('ℹ️ Нет ни черновика, ни активного голосования. Начни с /start_vote');
+    }
+
+    db.prepare(`UPDATE sessions SET date = ?, time = ?, datetime_status = 'confirmed' WHERE id = ?`)
+    .run(validDate, validTime, activeSession.id);
+
+    await refreshVoteMessage(activeSession.id);
+    const scheduleLine = formatScheduleLine(validDate, validTime, 'confirmed');
+    return ctx.reply(`✅ В активном голосовании дата/время подтверждены.\n${scheduleLine}`);
 });
 
 // 🚫 Отменить настройку голосования
@@ -714,16 +1019,15 @@ bot.command('confirm_vote', async (ctx) => {
 
     // Проверяем активное голосование
     const existingActive = db
-    .prepare(`SELECT id, format, needed_players, date, time
+    .prepare(`SELECT id, format, needed_players, date, time, datetime_status
               FROM sessions
               WHERE chat_id = ?
                 AND is_active = 1`)
     .get(ctx.chat.id);
     if (existingActive) {
-        const dateTimeInfo = formatDateTime(existingActive.date, existingActive.time);
-        const dateTimeText = dateTimeInfo ? `\n🗓️ ${dateTimeInfo}` : '';
+        const scheduleLine = formatScheduleLine(existingActive.date, existingActive.time, existingActive.datetime_status);
         return ctx.reply(
-            `⚠️ В этом чате уже запущено голосование (формат: ${ existingActive.format }).${dateTimeText}\n` +
+            `⚠️ В этом чате уже запущено голосование (формат: ${ existingActive.format }).\n${scheduleLine}\n` +
             `Чтобы начать новое, завершите текущее командой /end_vote.`,
         );
     }
@@ -738,22 +1042,30 @@ bot.command('confirm_vote', async (ctx) => {
     }
 
     // Создаем сессию голосования
+    const draftStatus = resolveDateTimeStatus(draft.datetime_status, draft.date, draft.time);
     const info = db
     .prepare(
-        `INSERT INTO sessions (chat_id, format, needed_players, is_active, author_id, date, time)
-         VALUES (?, ?, ?, 1, ?, ?, ?)`,
+        `INSERT INTO sessions (chat_id, format, needed_players, is_active, author_id, date, time, datetime_status)
+         VALUES (?, ?, ?, 1, ?, ?, ?, ?)`,
     )
-    .run(ctx.chat.id, draft.format, FORMATS[draft.format], ctx.from.id.toString(), draft.date, draft.time);
+    .run(
+        ctx.chat.id,
+        draft.format,
+        FORMATS[draft.format],
+        ctx.from.id.toString(),
+        draft.date,
+        draft.time,
+        draftStatus,
+    );
     const sessionId = info.lastInsertRowid;
 
     // Очищаем черновик
     db.prepare(`DELETE FROM draft_sessions WHERE chat_id = ?`).run(ctx.chat.id);
 
-    const dateTimeInfo = formatDateTime(draft.date, draft.time);
-    const dateTimeText = dateTimeInfo ? `\n🗓️ ${dateTimeInfo}` : '';
+    const scheduleLine = formatScheduleLine(draft.date, draft.time, draftStatus);
 
     const message = await ctx.reply(
-        `⚽ Голосование началось!\nФормат: ${draft.format} (нужно ${FORMATS[draft.format]} игроков)${dateTimeText}\n\nКто играет?`,
+        `⚽ Голосование началось!\nФормат: ${draft.format} (нужно ${FORMATS[draft.format]} игроков)\n${scheduleLine}\n\nКто играет?`,
         Markup.inlineKeyboard([
             [Markup.button.callback('✅ Играю', `vote:yes:${ sessionId }`)],
             [Markup.button.callback('❌ Не играю', `vote:no:${ sessionId }`)],
@@ -763,25 +1075,30 @@ bot.command('confirm_vote', async (ctx) => {
 
     // Сохраняем ID сообщения голосования
     db.prepare(`UPDATE sessions SET message_id = ? WHERE id = ?`).run(message.message_id, sessionId);
+
+    await sendVoteStartNotification(ctx.chat.id, sessionId, message.message_id);
 });
 
 // 🕐 Изменить дату и время голосования
 bot.command('set_datetime', async (ctx) => {
     const args = ctx.message.text.split(' ');
-    const date = args[1];
-    const time = args[2];
+    const dateInput = args[1];
+    const timeInput = args[2];
 
-    if (!date && !time) {
-        return ctx.reply('⚠️ Укажи дату и/или время: /set_datetime YYYY-MM-DD HH:MM\nПример: /set_datetime 2025-09-22 19:00');
+    if (!dateInput && !timeInput) {
+        return ctx.reply(
+            '⚠️ Укажи дату и/или время: /set_datetime <дата> <время>\n' +
+            'Примеры: /set_datetime завтра 19:30, /set_datetime 2026-02-21 19:30',
+        );
     }
 
-    const validDate = validateDate(date);
-    const validTime = validateTime(time);
+    const validDate = dateInput ? parseDateInput(dateInput) : null;
+    const validTime = timeInput ? validateTime(timeInput) : null;
 
-    if (date && !validDate) {
-        return ctx.reply('⚠️ Неверный формат даты. Используй YYYY-MM-DD (например: 2025-09-22)');
+    if (dateInput && !validDate) {
+        return ctx.reply('⚠️ Неверный формат даты. Примеры: 2026-02-21, 21.02, сегодня, завтра');
     }
-    if (time && !validTime) {
+    if (timeInput && !validTime) {
         return ctx.reply('⚠️ Неверный формат времени. Используй HH:MM (например: 19:00)');
     }
 
@@ -796,7 +1113,7 @@ bot.command('set_datetime', async (ctx) => {
     }
 
     const activeSession = db
-    .prepare(`SELECT id, format, date, time
+    .prepare(`SELECT id, format, date, time, datetime_status
               FROM sessions
               WHERE chat_id = ?
                 AND is_active = 1`)
@@ -810,10 +1127,13 @@ bot.command('set_datetime', async (ctx) => {
     db.prepare(`UPDATE sessions SET date = ?, time = ? WHERE id = ?`)
     .run(validDate || activeSession.date, validTime || activeSession.time, activeSession.id);
 
-    const newDateTimeInfo = formatDateTime(validDate || activeSession.date, validTime || activeSession.time);
-    const dateTimeText = newDateTimeInfo ? `\n🗓️ ${newDateTimeInfo}` : '';
-
-    await ctx.reply(`✅ Дата и время обновлены!${dateTimeText}`);
+    await refreshVoteMessage(activeSession.id);
+    const scheduleLine = formatScheduleLine(
+        validDate || activeSession.date,
+        validTime || activeSession.time,
+        activeSession.datetime_status,
+    );
+    await ctx.reply(`✅ Дата/время обновлены.\n${scheduleLine}`);
 });
 
 // 🔔 Напоминания каждые 2 часа
