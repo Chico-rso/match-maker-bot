@@ -310,12 +310,6 @@ const bot = new Telegraf(TOKEN);
 bot.telegram.setMyCommands([
     {command: 'start', description: 'Показать быстрый гид по боту'},
     {command: 'start_vote', description: 'Мастер запуска голосования (кнопки)'},
-    {command: 'set_time', description: 'Ручной режим: /set_time сегодня 19:00'},
-    {command: 'set_tentative', description: 'Ручной режим: сделать время предварительным'},
-    {command: 'confirm_datetime', description: 'Ручной режим: подтвердить дату/время'},
-    {command: 'confirm_vote', description: 'Запустить голосование'},
-    {command: 'cancel_setup', description: 'Отменить настройку голосования'},
-    {command: 'set_datetime', description: 'Изменить дату/время (ручной режим)'},
     {command: 'end_vote', description: 'Завершить текущее голосование'},
 ]);
 
@@ -330,78 +324,12 @@ const HELP_TEXT =
     `• выбери «⏳ Предварительно» в мастере\n` +
     `Когда время стало точным:\n` +
     `• выбери «✅ Точное» в мастере\n\n` +
-    `Ручные команды оставлены как запасной вариант.\n\n` +
     `Во время активного сбора:\n` +
-    `• /set_datetime ... — поменять дату/время\n` +
+    `• нажми «⚙️ Управление» под голосованием\n` +
     `• /end_vote — завершить голосование`;
 
 bot.start((ctx) => ctx.reply(HELP_TEXT));
 bot.command('help', (ctx) => ctx.reply(HELP_TEXT));
-
-// Хелпер старта голосования c проверками
-async function startVoteWithFormat(ctx, fmt, date = null, time = null) {
-    if (!fmt || !FORMATS[fmt]) {
-        return ctx.reply('⚠️ Укажи формат: /start_vote 6x6 | 7x7 | 8x8 | 9x9 [дата] [время HH:MM]');
-    }
-
-    // Валидация даты и времени
-    const validDate = parseDateInput(date);
-    const validTime = validateTime(time);
-    const datetimeStatus = (validDate && validTime) ? 'confirmed' : 'tentative';
-
-    if (date && !validDate) {
-        return ctx.reply('⚠️ Неверный формат даты. Примеры: 2026-02-21, 21.02, сегодня, завтра');
-    }
-    if (time && !validTime) {
-        return ctx.reply('⚠️ Неверный формат времени. Используй HH:MM (например: 19:00)');
-    }
-
-    try {
-        const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
-        const isAdmin = member.status === 'administrator' || member.status === 'creator';
-        if (!isAdmin) {
-            return ctx.reply('🚫 Запускать голосование могут только администраторы.');
-        }
-    } catch (err) {
-        return ctx.reply('🚫 Не удалось проверить права. Попробуйте позже.');
-    }
-    const existingActive = db
-    .prepare(`SELECT id, format, needed_players, date, time, datetime_status
-              FROM sessions
-              WHERE chat_id = ?
-                AND is_active = 1`)
-    .get(ctx.chat.id);
-    if (existingActive) {
-        const scheduleLine = formatScheduleLine(existingActive.date, existingActive.time, existingActive.datetime_status);
-        return ctx.reply(
-            `⚠️ В этом чате уже запущено голосование (формат: ${ existingActive.format }).\n${scheduleLine}\n` +
-            `Чтобы начать новое, завершите текущее командой /end_vote.`,
-        );
-    }
-    const info = db
-    .prepare(
-        `INSERT INTO sessions (chat_id, format, needed_players, is_active, author_id, date, time, datetime_status)
-         VALUES (?, ?, ?, 1, ?, ?, ?, ?)`,
-    )
-    .run(ctx.chat.id, fmt, FORMATS[fmt], ctx.from.id.toString(), validDate, validTime, datetimeStatus);
-    const sessionId = info.lastInsertRowid;
-
-    const scheduleLine = formatScheduleLine(validDate, validTime, datetimeStatus);
-
-    const message = await ctx.reply(
-        `⚽ Голосование началось!\nФормат: ${ fmt } (нужно ${ FORMATS[fmt] } игроков)\n${scheduleLine}\n\nКто играет?`,
-        Markup.inlineKeyboard([
-            [Markup.button.callback('✅ Играю', `vote:yes:${ sessionId }`)],
-            [Markup.button.callback('❌ Не играю', `vote:no:${ sessionId }`)],
-            [Markup.button.callback('🤔 Не знаю', `vote:maybe:${ sessionId }`)],
-        ]),
-    );
-
-    // Сохраняем ID сообщения голосования
-    db.prepare(`UPDATE sessions SET message_id = ? WHERE id = ?`).run(message.message_id, sessionId);
-
-    await sendVoteStartNotification(ctx.chat.id, sessionId, message.message_id);
-}
 
 // 📣 Мгновенное уведомление всем, кто ещё не проголосовал, при старте голосования
 async function sendVoteStartNotification(chatId, sessionId, messageId) {
@@ -478,6 +406,15 @@ function getSessionVoteLists(sessionId) {
     return { yes, no, maybe };
 }
 
+function buildVoteKeyboard(sessionId) {
+    return Markup.inlineKeyboard([
+        [Markup.button.callback('✅ Играю', `vote:yes:${ sessionId }`)],
+        [Markup.button.callback('🤔 Не знаю', `vote:maybe:${ sessionId }`)],
+        [Markup.button.callback('❌ Не играю', `vote:no:${ sessionId }`)],
+        [Markup.button.callback('⚙️ Управление', `manage:open:${ sessionId }`)],
+    ]);
+}
+
 async function refreshVoteMessage(sessionId) {
     const session = db.prepare(`SELECT * FROM sessions WHERE id = ?`).get(sessionId);
     if (!session) {
@@ -502,11 +439,7 @@ async function refreshVoteMessage(sessionId) {
                 `Игроков нужно: ${ session.needed_players }, уже есть: ${ totalYes }`,
                 {
                     parse_mode: 'Markdown',
-                    ...Markup.inlineKeyboard([
-                        [Markup.button.callback('✅ Играю', `vote:yes:${ session.id }`)],
-                        [Markup.button.callback('🤔 Не знаю', `vote:maybe:${ session.id }`)],
-                        [Markup.button.callback('❌ Не играю', `vote:no:${ session.id }`)],
-                    ]),
+                    ...buildVoteKeyboard(session.id),
                 },
             );
         } catch (err) {
@@ -741,15 +674,92 @@ async function createVoteSessionFromDraft(ctx, draft) {
     const scheduleLine = formatScheduleLine(draft.date, draft.time, draftStatus);
     const message = await ctx.reply(
         `⚽ Голосование началось!\nФормат: ${draft.format} (нужно ${FORMATS[draft.format]} игроков)\n${scheduleLine}\n\nКто играет?`,
-        Markup.inlineKeyboard([
-            [Markup.button.callback('✅ Играю', `vote:yes:${ sessionId }`)],
-            [Markup.button.callback('❌ Не играю', `vote:no:${ sessionId }`)],
-            [Markup.button.callback('🤔 Не знаю', `vote:maybe:${ sessionId }`)],
-        ]),
+        buildVoteKeyboard(sessionId),
     );
 
     db.prepare(`UPDATE sessions SET message_id = ? WHERE id = ?`).run(message.message_id, sessionId);
     await sendVoteStartNotification(ctx.chat.id, sessionId, message.message_id);
+}
+
+function buildManageMainKeyboard(sessionId, status) {
+    return [
+        [
+            Markup.button.callback(`${status === 'tentative' ? '✅ ' : ''}⏳ Предварительно`, `manage:status:tentative:${sessionId}`),
+            Markup.button.callback(`${status === 'confirmed' ? '✅ ' : ''}✅ Точное`, `manage:status:confirmed:${sessionId}`),
+        ],
+        [
+            Markup.button.callback('📅 Изменить дату', `manage:choose_date:${sessionId}`),
+            Markup.button.callback('🕐 Изменить время', `manage:choose_time:${sessionId}`),
+        ],
+        [Markup.button.callback('🛑 Завершить голосование', `manage:end:${sessionId}`)],
+        [Markup.button.callback('Закрыть', `manage:close:${sessionId}`)],
+    ];
+}
+
+function buildManageDateKeyboard(sessionId, currentDate) {
+    const rows = chunkArray(
+        getSetupDateOptions().map((opt) =>
+            Markup.button.callback(`${opt.value === currentDate ? '✅ ' : ''}${opt.label}`, `manage:date:${opt.value}:${sessionId}`),
+        ),
+        2,
+    );
+    rows.push([Markup.button.callback('Назад', `manage:open:${sessionId}`)]);
+    rows.push([Markup.button.callback('Закрыть', `manage:close:${sessionId}`)]);
+    return rows;
+}
+
+function buildManageTimeKeyboard(sessionId, currentTime) {
+    const rows = chunkArray(
+        getSetupTimeOptions().map((time) =>
+            Markup.button.callback(`${time === currentTime ? '✅ ' : ''}${time}`, `manage:time:${time.replace(':', '')}:${sessionId}`),
+        ),
+        3,
+    );
+    rows.push([Markup.button.callback('Назад', `manage:open:${sessionId}`)]);
+    rows.push([Markup.button.callback('Закрыть', `manage:close:${sessionId}`)]);
+    return rows;
+}
+
+function buildManageText(session) {
+    const scheduleLine = formatScheduleLine(session.date, session.time, session.datetime_status);
+    return `⚙️ Управление голосованием\nФормат: ${session.format}\n${scheduleLine}\n\nВыбери, что изменить:`;
+}
+
+async function renderManageMenu(ctx, sessionId, mode = 'main') {
+    const session = db.prepare(`SELECT * FROM sessions WHERE id = ? AND is_active = 1`).get(sessionId);
+    if (!session) {
+        if (ctx.callbackQuery) {
+            await ctx.answerCbQuery('Активное голосование не найдено');
+        } else {
+            await ctx.reply('ℹ️ Активного голосования нет.');
+        }
+        return;
+    }
+
+    let text = buildManageText(session);
+    let keyboard = buildManageMainKeyboard(session.id, resolveDateTimeStatus(session.datetime_status, session.date, session.time));
+
+    if (mode === 'date') {
+        text = `${buildManageText(session)}\n\nВыберите новую дату:`;
+        keyboard = buildManageDateKeyboard(session.id, session.date);
+    } else if (mode === 'time') {
+        text = `${buildManageText(session)}\n\nВыберите новое время:`;
+        keyboard = buildManageTimeKeyboard(session.id, session.time);
+    }
+
+    if (ctx.callbackQuery) {
+        try {
+            await ctx.editMessageText(text, Markup.inlineKeyboard(keyboard));
+        } catch (err) {
+            const desc = err?.response?.description || err?.description || err?.message || '';
+            if (!desc.includes('message is not modified')) {
+                console.error('renderManageMenu failed:', err);
+            }
+        }
+        return;
+    }
+
+    await ctx.reply(text, Markup.inlineKeyboard(keyboard));
 }
 
 // 📌 Добавляем новых участников в БД
@@ -772,68 +782,6 @@ bot.on('left_chat_member', (ctx) => {
     db.prepare(`DELETE
                 FROM members
                 WHERE id = ?`).run(member.id.toString());
-});
-
-// 📝 Обработка текстовых сообщений с датой/временем для настройки
-bot.use(async (ctx, next) => {
-    // Пропускаем если это не текстовое сообщение
-    if (!ctx.message || !ctx.message.text) {
-        return next();
-    }
-
-    const text = ctx.message.text.trim();
-
-    // Пропускаем команды (начинающиеся с /)
-    if (text.startsWith('/')) {
-        return next();
-    }
-
-    // Проверяем, есть ли активный черновик для этого чата
-    const draft = db
-    .prepare(`SELECT * FROM draft_sessions WHERE chat_id = ?`)
-    .get(ctx.chat.id);
-
-    if (!draft) {
-        return next(); // Нет активной настройки, пропускаем
-    }
-
-    // Проверяем, является ли сообщение датой и временем
-    const parts = text.split(' ');
-    if (parts.length === 2) {
-        const dateInput = parts[0];
-        const timeInput = parts[1];
-
-        const validDate = parseDateInput(dateInput);
-        const validTime = validateTime(timeInput);
-
-        if (validDate && validTime) {
-            try {
-                const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
-                const isAdmin = member.status === 'administrator' || member.status === 'creator';
-
-                if (isAdmin) {
-                    // Обновляем время в черновике
-                    db.prepare(`UPDATE draft_sessions SET date = ?, time = ?, datetime_status = 'tentative' WHERE chat_id = ?`)
-                    .run(validDate, validTime, ctx.chat.id);
-
-                    const scheduleLine = formatScheduleLine(validDate, validTime, 'tentative');
-                    await ctx.reply(
-                        `✅ Предварительное время установлено.\n\n` +
-                        `📋 Текущие настройки:\n` +
-                        `⚽ Формат: ${draft.format} (нужно ${FORMATS[draft.format]} игроков)\n` +
-                        `${scheduleLine}\n\n` +
-                        `🚀 Запусти голосование:\n` +
-                        `/confirm_vote`
-                    );
-                    return; // Не продолжаем обработку
-                }
-            } catch (err) {
-                // Игнорируем ошибки проверки прав
-            }
-        }
-    }
-
-    return next(); // Продолжаем обработку для других сообщений
 });
 
 // 🏁 Команда выбора формата игры
@@ -862,11 +810,9 @@ bot.command('start_vote', async (ctx) => {
                 AND is_active = 1`)
     .get(ctx.chat.id);
     if (existingActive) {
-        const scheduleLine = formatScheduleLine(existingActive.date, existingActive.time, existingActive.datetime_status);
-        return ctx.reply(
-            `⚠️ В этом чате уже запущено голосование (формат: ${ existingActive.format }).\n${scheduleLine}\n` +
-            `Чтобы начать новое, завершите текущее командой /end_vote.`,
-        );
+        await ctx.reply('ℹ️ Голосование уже активно. Открыл меню управления:');
+        await renderManageMenu(ctx, existingActive.id, 'main');
+        return;
     }
 
     // Создаём/обновляем черновик для кнопочного мастера
@@ -880,50 +826,20 @@ bot.command('start_vote', async (ctx) => {
 
 // Алиасы для быстрого выбора формата
 bot.command('start_6x6', async (ctx) => {
-    const args = ctx.message.text.split(' ');
-    // Если переданы дополнительные аргументы, используем старую логику
-    if (args[1]) {
-        const date = args[1];
-        const time = args[2];
-        await startVoteWithFormat(ctx, '6x6', date, time);
-    } else {
-        // Иначе используем новую логику выбора формата
-        ctx.message.text = '/start_vote 6x6';
-        await bot.handleUpdate({ message: ctx.message });
-    }
+    ctx.message.text = '/start_vote 6x6';
+    await bot.handleUpdate({ message: ctx.message });
 });
 bot.command('start_7x7', async (ctx) => {
-    const args = ctx.message.text.split(' ');
-    if (args[1]) {
-        const date = args[1];
-        const time = args[2];
-        await startVoteWithFormat(ctx, '7x7', date, time);
-    } else {
-        ctx.message.text = '/start_vote 7x7';
-        await bot.handleUpdate({ message: ctx.message });
-    }
+    ctx.message.text = '/start_vote 7x7';
+    await bot.handleUpdate({ message: ctx.message });
 });
 bot.command('start_8x8', async (ctx) => {
-    const args = ctx.message.text.split(' ');
-    if (args[1]) {
-        const date = args[1];
-        const time = args[2];
-        await startVoteWithFormat(ctx, '8x8', date, time);
-    } else {
-        ctx.message.text = '/start_vote 8x8';
-        await bot.handleUpdate({ message: ctx.message });
-    }
+    ctx.message.text = '/start_vote 8x8';
+    await bot.handleUpdate({ message: ctx.message });
 });
 bot.command('start_9x9', async (ctx) => {
-    const args = ctx.message.text.split(' ');
-    if (args[1]) {
-        const date = args[1];
-        const time = args[2];
-        await startVoteWithFormat(ctx, '9x9', date, time);
-    } else {
-        ctx.message.text = '/start_vote 9x9';
-        await bot.handleUpdate({ message: ctx.message });
-    }
+    ctx.message.text = '/start_vote 9x9';
+    await bot.handleUpdate({ message: ctx.message });
 });
 
 // 🎛 Обработка кнопок голосования
@@ -1121,6 +1037,126 @@ bot.on('callback_query', async (ctx, next) => {
     await ctx.answerCbQuery('Неизвестная команда');
 });
 
+// ⚙️ Управление активным голосованием только кнопками
+bot.on('callback_query', async (ctx, next) => {
+    const data = ctx.callbackQuery?.data || '';
+    if (!data.startsWith('manage:')) {
+        return next();
+    }
+
+    let isAdmin = false;
+    try {
+        const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
+        isAdmin = member.status === 'administrator' || member.status === 'creator';
+    } catch (err) {
+        isAdmin = false;
+    }
+
+    if (!isAdmin) {
+        await ctx.answerCbQuery('Только администратор может управлять голосованием', { show_alert: true });
+        return;
+    }
+
+    const parts = data.split(':');
+    const action = parts[1];
+
+    if (action === 'open' || action === 'choose_date' || action === 'choose_time' || action === 'close') {
+        const sessionId = Number(parts[2]);
+        if (!sessionId) {
+            await ctx.answerCbQuery('Некорректный идентификатор');
+            return;
+        }
+
+        if (action === 'close') {
+            try {
+                await ctx.editMessageText('✅ Управление закрыто.');
+            } catch (err) {
+                // ignore edit errors
+            }
+            await ctx.answerCbQuery();
+            return;
+        }
+
+        await renderManageMenu(ctx, sessionId, action === 'choose_date' ? 'date' : action === 'choose_time' ? 'time' : 'main');
+        await ctx.answerCbQuery();
+        return;
+    }
+
+    if (action === 'end') {
+        const sessionId = Number(parts[2]);
+        if (!sessionId) {
+            await ctx.answerCbQuery('Некорректный идентификатор');
+            return;
+        }
+
+        const active = db.prepare(`SELECT id, chat_id FROM sessions WHERE id = ? AND is_active = 1`).get(sessionId);
+        if (!active) {
+            await ctx.answerCbQuery('Голосование уже завершено');
+            return;
+        }
+
+        db.prepare(`UPDATE sessions SET is_active = 0 WHERE id = ?`).run(sessionId);
+
+        try {
+            await ctx.editMessageText('✅ Голосование завершено.');
+        } catch (err) {
+            // ignore edit errors
+        }
+
+        await ctx.answerCbQuery('Завершено');
+        await ctx.reply('✅ Голосование завершено. Можно запустить новое: /start_vote');
+        return;
+    }
+
+    if (action === 'status') {
+        const value = parts[2];
+        const sessionId = Number(parts[3]);
+        if (!sessionId || (value !== 'tentative' && value !== 'confirmed')) {
+            await ctx.answerCbQuery('Некорректные параметры');
+            return;
+        }
+
+        db.prepare(`UPDATE sessions SET datetime_status = ? WHERE id = ? AND is_active = 1`).run(value, sessionId);
+        await refreshVoteMessage(sessionId);
+        await renderManageMenu(ctx, sessionId, 'main');
+        await ctx.answerCbQuery('Статус обновлён');
+        return;
+    }
+
+    if (action === 'date') {
+        const isoDate = parts[2];
+        const sessionId = Number(parts[3]);
+        if (!sessionId || !parseDateInput(isoDate)) {
+            await ctx.answerCbQuery('Некорректная дата');
+            return;
+        }
+
+        db.prepare(`UPDATE sessions SET date = ? WHERE id = ? AND is_active = 1`).run(isoDate, sessionId);
+        await refreshVoteMessage(sessionId);
+        await renderManageMenu(ctx, sessionId, 'main');
+        await ctx.answerCbQuery('Дата обновлена');
+        return;
+    }
+
+    if (action === 'time') {
+        const timeRaw = parts[2];
+        const sessionId = Number(parts[3]);
+        const normalized = timeRaw && timeRaw.length === 4 ? `${timeRaw.slice(0, 2)}:${timeRaw.slice(2)}` : null;
+        if (!sessionId || !normalized || !validateTime(normalized)) {
+            await ctx.answerCbQuery('Некорректное время');
+            return;
+        }
+
+        db.prepare(`UPDATE sessions SET time = ? WHERE id = ? AND is_active = 1`).run(normalized, sessionId);
+        await refreshVoteMessage(sessionId);
+        await renderManageMenu(ctx, sessionId, 'main');
+        await ctx.answerCbQuery('Время обновлено');
+        return;
+    }
+
+    await ctx.answerCbQuery('Неизвестная команда');
+});
+
 // 🛑 Завершить текущее голосование
 bot.command('end_vote', async (ctx) => {
     const active = db
@@ -1131,7 +1167,7 @@ bot.command('end_vote', async (ctx) => {
     .get(ctx.chat.id);
     
     if (!active) {
-        return ctx.reply('ℹ️ Активного голосования нет. Запустить: /start_vote 6x6 | 7x7 | 8x8 | 9x9');
+        return ctx.reply('ℹ️ Активного голосования нет. Запустить: /start_vote');
     }
     
     let isAdmin = false;
@@ -1155,320 +1191,18 @@ bot.command('end_vote', async (ctx) => {
     // Очищаем черновик если он был
     db.prepare(`DELETE FROM draft_sessions WHERE chat_id = ?`).run(ctx.chat.id);
 
-    await ctx.reply('✅ Голосование завершено. Можно запустить новое: /start_vote 6x6 | 7x7 | 8x8 | 9x9');
+    await ctx.reply('✅ Голосование завершено. Можно запустить новое: /start_vote');
 });
 
-// 🕐 Установить время для голосования
-bot.command('set_time', async (ctx) => {
-    const args = ctx.message.text.split(' ');
-    const dateInput = args[1];
-    const timeInput = args[2];
+const BUTTONS_ONLY_TEXT =
+    'ℹ️ Ручной ввод отключён. Используй /start_vote и настраивай всё кнопками.';
 
-    if (!dateInput || !timeInput) {
-        return ctx.reply(
-            '⚠️ Укажи дату и время: /set_time <дата> <время>\n' +
-            'Примеры: /set_time сегодня 19:00, /set_time завтра 20:30, /set_time 21.02 19:00',
-        );
-    }
-
-    const validDate = parseDateInput(dateInput);
-    const validTime = validateTime(timeInput);
-
-    if (!validDate) {
-        return ctx.reply('⚠️ Неверный формат даты. Примеры: 2026-02-21, 21.02, сегодня, завтра');
-    }
-    if (!validTime) {
-        return ctx.reply('⚠️ Неверный формат времени. Используй HH:MM (например: 19:00)');
-    }
-
-    try {
-        const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
-        const isAdmin = member.status === 'administrator' || member.status === 'creator';
-        if (!isAdmin) {
-            return ctx.reply('🚫 Настраивать голосование могут только администраторы.');
-        }
-    } catch (err) {
-        return ctx.reply('🚫 Не удалось проверить права. Попробуйте позже.');
-    }
-
-    // Проверяем, есть ли черновик для этого чата
-    const draft = db
-    .prepare(`SELECT * FROM draft_sessions WHERE chat_id = ?`)
-    .get(ctx.chat.id);
-
-    if (!draft) {
-        return ctx.reply('ℹ️ Сначала выбери формат командой /start_vote 6x6|7x7|8x8|9x9');
-    }
-
-    // Обновляем предварительное время в черновике
-    db.prepare(`UPDATE draft_sessions SET date = ?, time = ?, datetime_status = 'tentative' WHERE chat_id = ?`)
-    .run(validDate, validTime, ctx.chat.id);
-
-    const scheduleLine = formatScheduleLine(validDate, validTime, 'tentative');
-    await ctx.reply(
-        `✅ Предварительное время установлено.\n\n` +
-        `📋 Текущие настройки:\n` +
-        `⚽ Формат: ${draft.format} (нужно ${FORMATS[draft.format]} игроков)\n` +
-        `${scheduleLine}\n\n` +
-        `Если время уже точное: /confirm_datetime YYYY-MM-DD HH:MM\n\n` +
-        `🚀 Запусти голосование:\n` +
-        `/confirm_vote`
-    );
-});
-
-// ⏳ Перевести время в предварительное (для черновика или активного голосования)
-bot.command('set_tentative', async (ctx) => {
-    const args = ctx.message.text.split(' ');
-    const dateInput = args[1];
-    const timeInput = args[2];
-
-    const validDate = dateInput ? parseDateInput(dateInput) : null;
-    const validTime = timeInput ? validateTime(timeInput) : null;
-
-    if (dateInput && !validDate) {
-        return ctx.reply('⚠️ Неверный формат даты. Примеры: 2026-02-21, 21.02, сегодня, завтра');
-    }
-    if (timeInput && !validTime) {
-        return ctx.reply('⚠️ Неверный формат времени. Используй HH:MM (например: 19:00)');
-    }
-
-    try {
-        const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
-        const isAdmin = member.status === 'administrator' || member.status === 'creator';
-        if (!isAdmin) {
-            return ctx.reply('🚫 Изменять статус времени могут только администраторы.');
-        }
-    } catch (err) {
-        return ctx.reply('🚫 Не удалось проверить права. Попробуйте позже.');
-    }
-
-    const draft = db
-    .prepare(`SELECT * FROM draft_sessions WHERE chat_id = ?`)
-    .get(ctx.chat.id);
-
-    if (draft) {
-        const nextDate = dateInput ? validDate : draft.date;
-        const nextTime = timeInput ? validTime : draft.time;
-
-        db.prepare(`UPDATE draft_sessions SET date = ?, time = ?, datetime_status = 'tentative' WHERE chat_id = ?`)
-        .run(nextDate, nextTime, ctx.chat.id);
-
-        const scheduleLine = formatScheduleLine(nextDate, nextTime, 'tentative');
-        return ctx.reply(
-            `⏳ Время отмечено как предварительное.\n\n` +
-            `📋 Текущие настройки:\n` +
-            `⚽ Формат: ${draft.format} (нужно ${FORMATS[draft.format]} игроков)\n` +
-            `${scheduleLine}\n\n` +
-            `🚀 Запусти голосование:\n` +
-            `/confirm_vote`,
-        );
-    }
-
-    const activeSession = db
-    .prepare(`SELECT id, date, time
-              FROM sessions
-              WHERE chat_id = ?
-                AND is_active = 1`)
-    .get(ctx.chat.id);
-
-    if (!activeSession) {
-        return ctx.reply('ℹ️ Нет ни черновика, ни активного голосования. Начни с /start_vote');
-    }
-
-    const nextDate = dateInput ? validDate : activeSession.date;
-    const nextTime = timeInput ? validTime : activeSession.time;
-
-    db.prepare(`UPDATE sessions SET date = ?, time = ?, datetime_status = 'tentative' WHERE id = ?`)
-    .run(nextDate, nextTime, activeSession.id);
-
-    await refreshVoteMessage(activeSession.id);
-    const scheduleLine = formatScheduleLine(nextDate, nextTime, 'tentative');
-    return ctx.reply(`⏳ В активном голосовании время стало предварительным.\n${scheduleLine}`);
-});
-
-// ✅ Подтвердить точную дату и время (для черновика или активного голосования)
-bot.command('confirm_datetime', async (ctx) => {
-    const args = ctx.message.text.split(' ');
-    const dateInput = args[1];
-    const timeInput = args[2];
-
-    if (!dateInput || !timeInput) {
-        return ctx.reply('⚠️ Укажи точные дату и время: /confirm_datetime YYYY-MM-DD HH:MM');
-    }
-
-    const validDate = parseDateInput(dateInput);
-    const validTime = validateTime(timeInput);
-
-    if (!validDate) {
-        return ctx.reply('⚠️ Неверный формат даты. Примеры: 2026-02-21, 21.02, сегодня, завтра');
-    }
-    if (!validTime) {
-        return ctx.reply('⚠️ Неверный формат времени. Используй HH:MM (например: 19:00)');
-    }
-
-    try {
-        const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
-        const isAdmin = member.status === 'administrator' || member.status === 'creator';
-        if (!isAdmin) {
-            return ctx.reply('🚫 Подтверждать дату/время могут только администраторы.');
-        }
-    } catch (err) {
-        return ctx.reply('🚫 Не удалось проверить права. Попробуйте позже.');
-    }
-
-    const draft = db
-    .prepare(`SELECT * FROM draft_sessions WHERE chat_id = ?`)
-    .get(ctx.chat.id);
-
-    if (draft) {
-        db.prepare(`UPDATE draft_sessions SET date = ?, time = ?, datetime_status = 'confirmed' WHERE chat_id = ?`)
-        .run(validDate, validTime, ctx.chat.id);
-
-        const scheduleLine = formatScheduleLine(validDate, validTime, 'confirmed');
-        return ctx.reply(
-            `✅ Точное время подтверждено.\n\n` +
-            `📋 Текущие настройки:\n` +
-            `⚽ Формат: ${draft.format} (нужно ${FORMATS[draft.format]} игроков)\n` +
-            `${scheduleLine}\n\n` +
-            `🚀 Запусти голосование:\n` +
-            `/confirm_vote`,
-        );
-    }
-
-    const activeSession = db
-    .prepare(`SELECT id
-              FROM sessions
-              WHERE chat_id = ?
-                AND is_active = 1`)
-    .get(ctx.chat.id);
-
-    if (!activeSession) {
-        return ctx.reply('ℹ️ Нет ни черновика, ни активного голосования. Начни с /start_vote');
-    }
-
-    db.prepare(`UPDATE sessions SET date = ?, time = ?, datetime_status = 'confirmed' WHERE id = ?`)
-    .run(validDate, validTime, activeSession.id);
-
-    await refreshVoteMessage(activeSession.id);
-    const scheduleLine = formatScheduleLine(validDate, validTime, 'confirmed');
-    return ctx.reply(`✅ В активном голосовании дата/время подтверждены.\n${scheduleLine}`);
-});
-
-// 🚫 Отменить настройку голосования
-bot.command('cancel_setup', async (ctx) => {
-    try {
-        const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
-        const isAdmin = member.status === 'administrator' || member.status === 'creator';
-        if (!isAdmin) {
-            return ctx.reply('🚫 Управлять настройками могут только администраторы.');
-        }
-    } catch (err) {
-        return ctx.reply('🚫 Не удалось проверить права. Попробуйте позже.');
-    }
-
-    const deleted = db.prepare(`DELETE FROM draft_sessions WHERE chat_id = ?`).run(ctx.chat.id);
-    if (deleted.changes > 0) {
-        await ctx.reply('✅ Настройка голосования отменена. Начни заново командой /start_vote');
-    } else {
-        await ctx.reply('ℹ️ Нет активной настройки для отмены.');
-    }
-});
-
-// ✅ Запустить голосование из черновика
-bot.command('confirm_vote', async (ctx) => {
-    try {
-        const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
-        const isAdmin = member.status === 'administrator' || member.status === 'creator';
-        if (!isAdmin) {
-            return ctx.reply('🚫 Запускать голосование могут только администраторы.');
-        }
-    } catch (err) {
-        return ctx.reply('🚫 Не удалось проверить права. Попробуйте позже.');
-    }
-
-    // Проверяем активное голосование
-    const existingActive = db
-    .prepare(`SELECT id, format, needed_players, date, time, datetime_status
-              FROM sessions
-              WHERE chat_id = ?
-                AND is_active = 1`)
-    .get(ctx.chat.id);
-    if (existingActive) {
-        const scheduleLine = formatScheduleLine(existingActive.date, existingActive.time, existingActive.datetime_status);
-        return ctx.reply(
-            `⚠️ В этом чате уже запущено голосование (формат: ${ existingActive.format }).\n${scheduleLine}\n` +
-            `Чтобы начать новое, завершите текущее командой /end_vote.`,
-        );
-    }
-
-    // Получаем черновик
-    const draft = db
-    .prepare(`SELECT * FROM draft_sessions WHERE chat_id = ?`)
-    .get(ctx.chat.id);
-
-    if (!draft || !draft.format) {
-        return ctx.reply('ℹ️ Сначала выбери формат командой /start_vote 6x6|7x7|8x8|9x9');
-    }
-
-    await createVoteSessionFromDraft(ctx, draft);
-});
-
-// 🕐 Изменить дату и время голосования
-bot.command('set_datetime', async (ctx) => {
-    const args = ctx.message.text.split(' ');
-    const dateInput = args[1];
-    const timeInput = args[2];
-
-    if (!dateInput && !timeInput) {
-        return ctx.reply(
-            '⚠️ Укажи дату и/или время: /set_datetime <дата> <время>\n' +
-            'Примеры: /set_datetime завтра 19:30, /set_datetime 2026-02-21 19:30',
-        );
-    }
-
-    const validDate = dateInput ? parseDateInput(dateInput) : null;
-    const validTime = timeInput ? validateTime(timeInput) : null;
-
-    if (dateInput && !validDate) {
-        return ctx.reply('⚠️ Неверный формат даты. Примеры: 2026-02-21, 21.02, сегодня, завтра');
-    }
-    if (timeInput && !validTime) {
-        return ctx.reply('⚠️ Неверный формат времени. Используй HH:MM (например: 19:00)');
-    }
-
-    try {
-        const member = await ctx.telegram.getChatMember(ctx.chat.id, ctx.from.id);
-        const isAdmin = member.status === 'administrator' || member.status === 'creator';
-        if (!isAdmin) {
-            return ctx.reply('🚫 Изменять дату/время могут только администраторы.');
-        }
-    } catch (err) {
-        return ctx.reply('🚫 Не удалось проверить права. Попробуйте позже.');
-    }
-
-    const activeSession = db
-    .prepare(`SELECT id, format, date, time, datetime_status
-              FROM sessions
-              WHERE chat_id = ?
-                AND is_active = 1`)
-    .get(ctx.chat.id);
-
-    if (!activeSession) {
-        return ctx.reply('ℹ️ Активного голосования нет. Сначала запусти голосование командой /start_vote');
-    }
-
-    // Обновляем дату и время
-    db.prepare(`UPDATE sessions SET date = ?, time = ? WHERE id = ?`)
-    .run(validDate || activeSession.date, validTime || activeSession.time, activeSession.id);
-
-    await refreshVoteMessage(activeSession.id);
-    const scheduleLine = formatScheduleLine(
-        validDate || activeSession.date,
-        validTime || activeSession.time,
-        activeSession.datetime_status,
-    );
-    await ctx.reply(`✅ Дата/время обновлены.\n${scheduleLine}`);
-});
+bot.command('set_time', (ctx) => ctx.reply(BUTTONS_ONLY_TEXT));
+bot.command('set_tentative', (ctx) => ctx.reply(BUTTONS_ONLY_TEXT));
+bot.command('confirm_datetime', (ctx) => ctx.reply(BUTTONS_ONLY_TEXT));
+bot.command('confirm_vote', (ctx) => ctx.reply(BUTTONS_ONLY_TEXT));
+bot.command('set_datetime', (ctx) => ctx.reply(BUTTONS_ONLY_TEXT));
+bot.command('cancel_setup', (ctx) => ctx.reply(BUTTONS_ONLY_TEXT));
 
 // 🔔 Напоминания каждые 2 часа
 cron.schedule('0 */2 * * *', async () => {
