@@ -51,6 +51,22 @@ function buildVoteMessageLink(chatId, messageId) {
     return `https://t.me/c/${normalizedChatId}/${messageId}`;
 }
 
+const REMINDER_INTERVAL_MINUTES = 80;
+const REMINDER_TIMEZONE = 'Europe/Moscow';
+
+function shouldSendReminder(lastReminderAt, now = Date.now()) {
+    if (!lastReminderAt) {
+        return true;
+    }
+
+    const lastReminderTs = new Date(lastReminderAt).getTime();
+    if (!Number.isFinite(lastReminderTs)) {
+        return true;
+    }
+
+    return now - lastReminderTs >= REMINDER_INTERVAL_MINUTES * 60 * 1000;
+}
+
 // 📝 Функция для красивого форматирования списка игроков
 function formatPlayersList(players, maxDisplay = 100) {
     if (!players || players.length === 0) {
@@ -280,6 +296,7 @@ migrateTable('sessions', 'date', 'TEXT');
 migrateTable('sessions', 'time', 'TEXT');
 migrateTable('sessions', 'message_id', 'INTEGER');
 migrateTable('sessions', 'datetime_status', 'TEXT');
+migrateTable('sessions', 'last_reminder_at', 'TEXT');
 
 db.prepare(
     `CREATE TABLE IF NOT EXISTS votes
@@ -387,6 +404,7 @@ async function sendVoteStartNotification(chatId, sessionId, messageId) {
             `📢 Голосование запущено! Пожалуйста, отметьтесь.${voteLink}\n${mentions}`,
             { parse_mode: 'Markdown' },
         );
+        db.prepare(`UPDATE sessions SET last_reminder_at = ? WHERE id = ?`).run(new Date().toISOString(), sessionId);
     } catch (err) {
         console.error('sendVoteStartNotification failed:', err?.message || err);
     }
@@ -1218,10 +1236,10 @@ bot.command('confirm_vote', (ctx) => ctx.reply(BUTTONS_ONLY_TEXT));
 bot.command('set_datetime', (ctx) => ctx.reply(BUTTONS_ONLY_TEXT));
 bot.command('cancel_setup', (ctx) => ctx.reply(BUTTONS_ONLY_TEXT));
 
-// 🔔 Напоминания каждые 2 часа
-cron.schedule('0 */2 * * *', async () => {
+// 🔔 Напоминания для каждого голосования каждые 80 минут по Москве
+cron.schedule('*/20 * * * *', async () => {
     const activeSessions = db
-    .prepare(`SELECT id, chat_id, message_id
+    .prepare(`SELECT id, chat_id, message_id, last_reminder_at
               FROM sessions
               WHERE is_active = 1`)
     .all();
@@ -1230,7 +1248,14 @@ cron.schedule('0 */2 * * *', async () => {
         return;
     }
 
+    const nowIso = new Date().toISOString();
+    const nowTs = Date.now();
+
     for (const session of activeSessions) {
+        if (!shouldSendReminder(session.last_reminder_at, nowTs)) {
+            continue;
+        }
+
         const votedUserIds = db
         .prepare(`SELECT user_id
                   FROM votes
@@ -1267,8 +1292,11 @@ cron.schedule('0 */2 * * *', async () => {
                 mentions,
                 { parse_mode: 'Markdown' }
             );
+            db.prepare(`UPDATE sessions SET last_reminder_at = ? WHERE id = ?`).run(nowIso, session.id);
         }
     }
+}, {
+    timezone: REMINDER_TIMEZONE,
 });
 
 // 🚀 Express healthcheck
