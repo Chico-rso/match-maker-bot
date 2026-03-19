@@ -34,6 +34,23 @@ function formatPlayerMention(member) {
     }
 }
 
+function buildVoteMessageLink(chatId, messageId) {
+    if (!chatId || !messageId) {
+        return '';
+    }
+
+    const rawChatId = String(chatId);
+    const normalizedChatId = rawChatId.startsWith('-100')
+        ? rawChatId.slice(4)
+        : rawChatId.replace(/^-/, '');
+
+    if (!normalizedChatId) {
+        return '';
+    }
+
+    return `https://t.me/c/${normalizedChatId}/${messageId}`;
+}
+
 // 📝 Функция для красивого форматирования списка игроков
 function formatPlayersList(players, maxDisplay = 100) {
     if (!players || players.length === 0) {
@@ -361,11 +378,8 @@ async function sendVoteStartNotification(chatId, sessionId, messageId) {
         return;
     }
 
-    let voteLink = '';
-    if (messageId) {
-        const normalizedChatId = chatId.toString().replace('-', '');
-        voteLink = ` [Открыть голосование](https://t.me/c/${normalizedChatId}/${messageId})`;
-    }
+    const voteMessageLink = buildVoteMessageLink(chatId, messageId);
+    const voteLink = voteMessageLink ? ` [Открыть голосование](${voteMessageLink})` : '';
 
     try {
         await bot.telegram.sendMessage(
@@ -1244,12 +1258,8 @@ cron.schedule('0 */2 * * *', async () => {
         .join(', ');
 
         if (mentions.length > 0) {
-            // Создаем ссылку на голосование
-            let voteLink = '';
-            if (session.message_id) {
-                const chatId = session.chat_id.toString().replace('-', ''); // Убираем минус для супергрупп
-                voteLink = ` [Голосование](https://t.me/c/${chatId}/${session.message_id})`;
-            }
+            const voteMessageLink = buildVoteMessageLink(session.chat_id, session.message_id);
+            const voteLink = voteMessageLink ? ` [Голосование](${voteMessageLink})` : '';
 
             await bot.telegram.sendMessage(
                 session.chat_id,
