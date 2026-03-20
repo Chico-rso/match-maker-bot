@@ -3,11 +3,21 @@ import express from 'express';
 import { Telegraf, Markup } from 'telegraf';
 import cron from 'node-cron';
 import Database from 'better-sqlite3';
+import { ProxyAgent } from 'proxy-agent';
 
 const app = express();
 
 const TOKEN = process.env.BOT_TOKEN;
 const PORT = process.env.PORT || 3000;
+const TELEGRAM_PROXY_URL = [
+    process.env.TELEGRAM_PROXY_URL,
+    process.env.HTTPS_PROXY,
+    process.env.HTTP_PROXY,
+    process.env.ALL_PROXY,
+    process.env.GLOBAL_HTTP_PROXY,
+]
+    .map((value) => value?.trim())
+    .find(Boolean) || '';
 
 // ⚽ Конфигурация форматов
 const FORMATS = {
@@ -16,6 +26,50 @@ const FORMATS = {
     '8x8': 16,
     '9x9': 18,
 };
+
+function maskProxyUrl(proxyUrl) {
+    if (!proxyUrl) {
+        return '';
+    }
+
+    try {
+        const parsed = new URL(proxyUrl);
+        if (parsed.username) parsed.username = '***';
+        if (parsed.password) parsed.password = '***';
+        return parsed.toString();
+    } catch {
+        return '[invalid proxy url]';
+    }
+}
+
+function getLaunchErrorHint(err) {
+    const description = err?.response?.description || err?.description || err?.message || '';
+    const networkCode = err?.code || err?.cause?.code || '';
+
+    if (description.includes('Bot Token is required') || err?.response?.error_code === 401) {
+        return 'Проверь BOT_TOKEN в переменных окружения.';
+    }
+
+    if (description.includes('Conflict: terminated by other getUpdates request') || err?.response?.error_code === 409) {
+        return 'Похоже, другой инстанс бота уже делает getUpdates с этим токеном.';
+    }
+
+    if ([
+        'ETIMEDOUT',
+        'ECONNREFUSED',
+        'ENOTFOUND',
+        'EAI_AGAIN',
+        'UND_ERR_CONNECT_TIMEOUT',
+    ].includes(networkCode)) {
+        return 'Сервер не может подключиться к api.telegram.org. Проверь сеть сервера или настройки прокси.';
+    }
+
+    if (description.includes('FetchError') || description.includes('fetch failed')) {
+        return 'Не удалось выполнить запрос к Telegram API. Проверь сеть сервера или настройки прокси.';
+    }
+
+    return '';
+}
 
 // 📝 Функция для создания кликабельного упоминания пользователя
 function formatPlayerMention(member) {
@@ -338,7 +392,13 @@ db.prepare(
 
 migrateTable('draft_sessions', 'datetime_status', 'TEXT');
 
-const bot = new Telegraf(TOKEN);
+const telegramAgent = TELEGRAM_PROXY_URL ? new ProxyAgent(TELEGRAM_PROXY_URL) : undefined;
+const bot = new Telegraf(TOKEN, {
+    telegram: {
+        agent: telegramAgent,
+        attachmentAgent: telegramAgent,
+    },
+});
 
 // Регистрируем меню команд с готовыми опциями
 bot.telegram.setMyCommands([
@@ -1309,13 +1369,19 @@ app.listen(PORT, () => {
 });
 
 console.log('🚀 Запуск бота...');
+if (TELEGRAM_PROXY_URL) {
+    console.log(`🌐 Telegram proxy enabled: ${maskProxyUrl(TELEGRAM_PROXY_URL)}`);
+}
 
 // ▶️ Запуск
 console.log('🔗 Подключение к Telegram API...');
 bot.launch().then(() => {
     console.log('✅ Бот успешно запущен и подключен к Telegram!');
 }).catch((err) => {
-    console.error('❌ Ошибка запуска бота:', err.message);
-    console.error('Проверь BOT_TOKEN в переменных окружения');
+    console.error('❌ Ошибка запуска бота:', err?.message || err);
+    const hint = getLaunchErrorHint(err);
+    if (hint) {
+        console.error(hint);
+    }
     process.exit(1);
 });

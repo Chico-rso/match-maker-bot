@@ -14,6 +14,24 @@ Telegram-бот для сбора игроков на матч через гол
    npm start
    ```
 
+## Прокси для Telegram API
+
+Если сервер не достукивается до `api.telegram.org`, бот можно пустить через прокси.
+Поддерживаются переменные, как в `pibot`:
+
+```env
+BOT_TOKEN=...
+TELEGRAM_PROXY_URL=http://user:password@proxy-host:proxy-port
+```
+
+Фолбэки тоже поддерживаются:
+- `HTTPS_PROXY`
+- `HTTP_PROXY`
+- `ALL_PROXY`
+- `GLOBAL_HTTP_PROXY`
+
+После обновления `.env` достаточно перезапустить `pm2`-процесс бота.
+
 ## CI/CD автодеплой (GitHub Actions)
 
 В репозитории настроен workflow `.github/workflows/deploy.yml`:
