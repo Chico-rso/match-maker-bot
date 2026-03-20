@@ -392,7 +392,11 @@ db.prepare(
 
 migrateTable('draft_sessions', 'datetime_status', 'TEXT');
 
-const telegramAgent = TELEGRAM_PROXY_URL ? new ProxyAgent(TELEGRAM_PROXY_URL) : undefined;
+const telegramAgent = TELEGRAM_PROXY_URL
+    ? new ProxyAgent({
+        getProxyForUrl: () => TELEGRAM_PROXY_URL,
+    })
+    : undefined;
 const bot = new Telegraf(TOKEN, {
     telegram: {
         agent: telegramAgent,
