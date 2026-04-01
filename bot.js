@@ -4,6 +4,7 @@ import { Telegraf, Markup } from 'telegraf';
 import cron from 'node-cron';
 import Database from 'better-sqlite3';
 import { ProxyAgent } from 'proxy-agent';
+import { buildVoteNotificationText } from './vote-notifications.js';
 
 const app = express();
 
@@ -460,12 +461,16 @@ async function sendVoteStartNotification(chatId, sessionId, messageId) {
     }
 
     const voteMessageLink = buildVoteMessageLink(chatId, messageId);
-    const voteLink = voteMessageLink ? ` [Открыть голосование](${voteMessageLink})` : '';
+    const messageText = buildVoteNotificationText({
+        introLine: '📢 Голосование запущено! Пожалуйста, отметьтесь.',
+        voteMessageLink,
+        mentions,
+    });
 
     try {
         await bot.telegram.sendMessage(
             chatId,
-            `📢 Голосование запущено! Пожалуйста, отметьтесь.${voteLink}\n${mentions}`,
+            messageText,
             { parse_mode: 'Markdown' },
         );
         db.prepare(`UPDATE sessions SET last_reminder_at = ? WHERE id = ?`).run(new Date().toISOString(), sessionId);
@@ -1348,12 +1353,15 @@ cron.schedule('*/20 * * * *', async () => {
 
         if (mentions.length > 0) {
             const voteMessageLink = buildVoteMessageLink(session.chat_id, session.message_id);
-            const voteLink = voteMessageLink ? ` [Голосование](${voteMessageLink})` : '';
+            const messageText = buildVoteNotificationText({
+                introLine: '⏰ Напоминание! Проголосуйте, если ещё не отметились.',
+                voteMessageLink,
+                mentions,
+            });
 
             await bot.telegram.sendMessage(
                 session.chat_id,
-                `⏰ Напоминание! Проголосуйте, если ещё не отметились.${voteLink}\n` +
-                mentions,
+                messageText,
                 { parse_mode: 'Markdown' }
             );
             db.prepare(`UPDATE sessions SET last_reminder_at = ? WHERE id = ?`).run(nowIso, session.id);
